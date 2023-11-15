@@ -7,10 +7,11 @@ use sha1::{Sha1, Digest};
 use serde::{Serialize, Deserialize};
 use tokio::fs::{File, OpenOptions, create_dir, read_dir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt, SeekFrom, BufReader, BufWriter};
+use tokio::sync::broadcast;
 
 
 #[derive(Deserialize)]
-struct QueueEntry {
+struct DiskEntry {
     pub time: i64,
     pub payload: Vec<u8>,
     pub hash: [u8; 20],
@@ -18,18 +19,29 @@ struct QueueEntry {
 
 
 #[derive(Serialize)]
-struct QueueEntrySer<'a> {
+struct DiskEntrySer<'a> {
     pub time: i64,
     pub payload: &'a[u8],
     pub hash: [u8; 20],
 }
 
+
+#[derive(Clone)]
+pub struct Entry {
+    pub index: u64,
+    pub time: i64,
+    pub payload: Vec<u8>,
+}
+
+
 pub async fn create_durable_queue(base_dir: &Path, queue_name: &str) -> Result<(DurableQueueWriter, DurableQueueReader), std::io::Error> {
     let mut queue_path = PathBuf::from(base_dir);
     queue_path.push(queue_name);
+    create_dir(&queue_path).await?; 
+    let (broadcast_tx, broadcast_rx) = broadcast::channel(1_000);
 
-    let writer = DurableQueueWriter::create(queue_path.as_path()).await?;
-    let reader = DurableQueueReader::new(queue_path.as_path()).await?;
+    let writer = DurableQueueWriter::create(queue_path.as_path(), broadcast_tx).await?;
+    let reader = DurableQueueReader::new(queue_path.as_path(), broadcast_rx, 0, 0).await?;
 
     Ok((writer, reader))
 }
@@ -37,8 +49,11 @@ pub async fn create_durable_queue(base_dir: &Path, queue_name: &str) -> Result<(
 pub struct DurableQueueWriter {
     base_dir: PathBuf,
     log_file: BufWriter<File>,
+
     current_offset: u64,
-    index: u64
+    index: u64,
+
+    queue: broadcast::Sender<Entry>
 }
 
 
@@ -106,8 +121,7 @@ impl DurableQueueWriter {
     }
 
     /// Constructors
-    pub async fn create(base_dir: &Path) -> Result<Self, std::io::Error> {
-        create_dir(base_dir).await?; 
+    pub async fn create(base_dir: &Path, queue: broadcast::Sender<Entry>) -> Result<Self, std::io::Error> {
         Self::write_lock(base_dir).await?;
         let log_path = base_dir.join(format!("0.{}", LOG_EXT));
         let log_file = OpenOptions::new()
@@ -122,10 +136,11 @@ impl DurableQueueWriter {
             log_file,
             current_offset: 0,
             index: 0,
+            queue,
         })
     }
 
-    pub async fn from_path(base_dir: &Path) -> Result<Self, std::io::Error> {
+    pub async fn from_path(base_dir: &Path, queue: broadcast::Sender<Entry>) -> Result<Self, std::io::Error> {
         Self::write_lock(base_dir).await?;
 
         let current_segment = Self::find_max_index(base_dir).await?.unwrap_or(0);
@@ -144,6 +159,7 @@ impl DurableQueueWriter {
             log_file,
             current_offset,
             index,
+            queue,
         })
     }
 
@@ -151,7 +167,7 @@ impl DurableQueueWriter {
         self.index
     }
 
-    async fn inner_push<'a>(&mut self, entry: &'a QueueEntrySer<'a>) -> Result<(), std::io::Error> {
+    async fn inner_push<'a>(&mut self, entry: &'a DiskEntrySer<'a>) -> Result<(), std::io::Error> {
         let serialized = serde_cbor::to_vec(entry).map_err(|e|
             std::io::Error::new(std::io::ErrorKind::Other,
                                 format!("Serialization error: {:?}", e))
@@ -168,15 +184,20 @@ impl DurableQueueWriter {
         self.log_file.write_all(&ser_index).await?;
         self.log_file.flush().await?;
 
-        self.index += 1;
-
         Ok(())
+    }
+
+    fn queue_push(&mut self, time: i64, payload: &[u8]) {
+        self.queue.send(Entry{index: self.index, time, payload: payload.to_vec()}).ok();
     }
 
     pub async fn push(&mut self, payload: &[u8]) -> Result<(), std::io::Error> { 
         let now = Utc::now().timestamp();
-        let entry = QueueEntrySer{payload, hash: [0; 20], time: now};
-        self.inner_push(&entry).await
+        let entry = DiskEntrySer{payload, hash: [0; 20], time: now};
+        self.inner_push(&entry).await?;
+        self.queue_push(now, payload);
+        self.index += 1;
+        Ok(())
     }
 
     pub async fn push_with_hash(&mut self, payload: &[u8]) -> Result<(), std::io::Error> {
@@ -184,8 +205,11 @@ impl DurableQueueWriter {
         let mut hasher = Sha1::new();
         hasher.update(payload);
         let hash = hasher.finalize();
-        let entry = QueueEntrySer{payload, hash: hash.into(), time: now};
-        self.inner_push(&entry).await
+        let entry = DiskEntrySer{payload, hash: hash.into(), time: now};
+        self.inner_push(&entry).await?;
+        self.queue_push(now, payload);
+        self.index += 1;
+        Ok(())
     }
 }
 
@@ -194,13 +218,18 @@ pub struct DurableQueueReader {
     log_file: BufReader<File>,
 
     index: u64,
-    file_index: u64,
-    last_read_offset: usize
+    memory_index: u64,
+    last_read_offset: usize,
+
+    queue: broadcast::Receiver<Entry>
 }
 
 
 impl DurableQueueReader {
-    pub async fn new(base_dir: &Path) -> Result<Self, std::io::Error> {
+    pub async fn new(base_dir: &Path,
+                     queue: broadcast::Receiver<Entry>,
+                     start_index: u64,
+                     memory_index: u64) -> Result<Self, std::io::Error> {
         let current_segment = 0;  // TODO: Modify segment based on start index. 
 
         let mut log_path = PathBuf::from(base_dir);
@@ -210,13 +239,46 @@ impl DurableQueueReader {
 
         Ok(Self {
             log_file,
-            index: 0,
-            file_index: 0,
-            last_read_offset: 0
+            index: start_index,
+            memory_index,
+            last_read_offset: 0,
+            queue
         })
     }
 
-    async fn read_from_queue(&mut self) -> Result<Option<(u64, QueueEntry)>, std::io::Error> {
+    pub async fn read_next(&mut self) -> Result<Entry, std::io::Error> {
+        if self.index >= self.memory_index {
+            let entry = self.queue.recv().await.map_err(|_|
+                std::io::Error::new(std::io::ErrorKind::NotConnected,
+                "Broadcast has closed"
+            ))?;
+            self.index = entry.index;
+            return Ok(entry);
+        }
+
+        Ok(match self.read_from_log().await? {
+            Some((i, v)) => {
+                self.index = i;
+                Entry {
+                    index: i,
+                    time: v.time,
+                    payload: v.payload
+                }
+            }
+            None => {
+                // Ran out of data, read from the memory queue.
+                self.memory_index = self.index;
+                let entry = self.queue.recv().await.map_err(|_|
+                    std::io::Error::new(std::io::ErrorKind::NotConnected,
+                    "Broadcast has closed"
+                ))?;
+                self.index = entry.index;
+                entry
+            }
+        })
+    }
+
+    async fn read_from_log(&mut self) -> Result<Option<(u64, DiskEntry)>, std::io::Error> {
         let len = match self.log_file.read_u64().await {
             Ok(v) => v as usize,
             Err(e) => {
@@ -233,25 +295,17 @@ impl DurableQueueReader {
         let entry_size = std::mem::size_of::<u64>();
         self.last_read_offset += entry_size * 2 + len;
 
-        let entry: QueueEntry = serde_cbor::from_slice(&contents).map_err(|e|
+        let entry: DiskEntry = serde_cbor::from_slice(&contents).map_err(|e|
             std::io::Error::new(std::io::ErrorKind::Other,
                                 format!("DeserializationError: {:?}", e))
         )?;
-        Ok(Some((index, entry)))
-    }
-
-    pub async fn read_next_verify_hash(&mut self) -> Result<Option<(i64, Vec<u8>)>, std::io::Error> {
-        let (index, entry) = match self.read_from_queue().await? {
-            Some(q) => q,
-            None => return Ok(None)
-        };
-        self.index = index;
 
         if entry.hash != [0; 20] {
             let mut hasher = Sha1::new();
             hasher.update(&entry.payload);
             let hash: [u8; 20] = hasher.finalize().into();
             if entry.hash != hash {
+                // TODO: This should probably just drop hashes from the stream.
                 return Err(
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -261,16 +315,7 @@ impl DurableQueueReader {
             }
         }
 
-        Ok(Some((entry.time, entry.payload)))
-    }
-
-    pub async fn read_next(&mut self) -> Result<Option<(i64, Vec<u8>)>, std::io::Error> {
-        let (index, entry) = match self.read_from_queue().await? {
-            Some(q) => q,
-            None => return Ok(None)
-        };
-        self.index = index;
-        Ok(Some((entry.time, entry.payload)))
+        Ok(Some((index, entry)))
     }
 }
 
@@ -312,12 +357,12 @@ mod tests {
         let payload3 = b"Hello, World! 3".to_vec();
         block_on(writer.push(&payload3)).expect("Failed to push to queue");
 
-        let (_time, read_payload) = block_on(reader.read_next()).expect("Failed to read from queue").expect("No entry found");
-        assert_eq!(payload1, read_payload);
-        let (_time, read_payload) = block_on(reader.read_next()).expect("Failed to read from queue").expect("No entry found");
-        assert_eq!(payload2, read_payload);
-        let (_time, read_payload) = block_on(reader.read_next()).expect("Failed to read from queue").expect("No entry found");
-        assert_eq!(payload3, read_payload);
+        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
+        assert_eq!(payload1, entry.payload);
+        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
+        assert_eq!(payload2, entry.payload);
+        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
+        assert_eq!(payload3, entry.payload);
     }
 
     #[test]
@@ -325,11 +370,11 @@ mod tests {
         let dir = setup();
         let base_dir = dir.path().to_path_buf();
         let (mut writer, mut reader) = block_on(create_durable_queue(&base_dir, "test_push_with_hash_and_verify")).expect("Failed to create queue");
+        reader.memory_index = 1;
 
         let payload = b"Test Payload".to_vec();
         block_on(writer.push_with_hash(&payload)).expect("Failed to push to queue");
-
-        let (_time, read_payload) = block_on(reader.read_next_verify_hash()).expect("Failed to read from queue").expect("No entry found");
-        assert_eq!(payload, read_payload);
+        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
+        assert_eq!(payload, entry.payload);
     }
 }

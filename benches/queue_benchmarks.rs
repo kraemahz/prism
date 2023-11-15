@@ -16,8 +16,9 @@ async fn push_benchmark(writer: Rc<RefCell<DurableQueueWriter>>) {
     writer.borrow_mut().push(&PAYLOAD).await.expect("Failed to push to queue");
 }
 
-async fn read_benchmark(reader: Rc<RefCell<DurableQueueReader>>) {
-    while let Some(_) = reader.borrow_mut().read_next().await.expect("Failed to read from queue") {}
+async fn read_benchmark(writer: Rc<RefCell<DurableQueueWriter>>, reader: Rc<RefCell<DurableQueueReader>>) {
+    writer.borrow_mut().push(&PAYLOAD).await.expect("Failed to push to queue");
+    reader.borrow_mut().read_next().await.expect("Faield to read message");
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
@@ -34,14 +35,10 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("read_benchmark", |b| {
         let dir = setup();
         let base_dir = dir.path();
-        let (mut writer, reader) = rt.block_on(create_durable_queue(base_dir, "read_bench")).expect("Failed to create queue");
+        let (writer, reader) = rt.block_on(create_durable_queue(base_dir, "read_bench")).expect("Failed to create queue");
+        let w = Rc::new(RefCell::new(writer));
         let r = Rc::new(RefCell::new(reader));
-        rt.block_on(async {
-            for _ in 0..100 {
-                writer.push(&PAYLOAD).await.expect("Failed to push")
-            }
-        });
-        b.to_async(&rt).iter(move || read_benchmark(r.clone()));
+        b.to_async(&rt).iter(move || read_benchmark(w.clone(), r.clone()));
     });
 }
 
