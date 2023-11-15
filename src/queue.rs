@@ -2,28 +2,18 @@ use std::ffi::OsStr;
 use std::fs::remove_file;
 use std::path::{Path, PathBuf};
 
+use capnp::message::{Builder, ReaderOptions};
+use capnp_futures::{ReadStream, serialize};
 use chrono::Utc;
-use sha1::{Sha1, Digest};
-use serde::{Serialize, Deserialize};
+use crc32fast::Hasher;
+use log::warn;
+use futures_util::StreamExt;
 use tokio::fs::{File, OpenOptions, create_dir, read_dir};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt, SeekFrom, BufReader, BufWriter};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::broadcast;
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-
-#[derive(Deserialize)]
-struct DiskEntry {
-    pub time: i64,
-    pub payload: Vec<u8>,
-    pub hash: [u8; 20],
-}
-
-
-#[derive(Serialize)]
-struct DiskEntrySer<'a> {
-    pub time: i64,
-    pub payload: &'a[u8],
-    pub hash: [u8; 20],
-}
+use crate::log_capnp::disk_entry;
 
 
 #[derive(Clone)]
@@ -50,9 +40,7 @@ pub struct DurableQueueWriter {
     base_dir: PathBuf,
     log_file: BufWriter<File>,
 
-    current_offset: u64,
     index: u64,
-
     queue: broadcast::Sender<Entry>
 }
 
@@ -89,19 +77,27 @@ impl DurableQueueWriter {
     }
 
     /// Function to read the last offset from the offset file
-    async fn read_last_offset(file: &mut File) -> Result<(u64, u64), std::io::Error> {
-        let mut file = BufReader::new(file);
-        let entry_size = std::mem::size_of::<u64>();
-        let seek_from = -i64::try_from(entry_size).unwrap();
+    async fn read_last_index(file: &mut File) -> Result<u64, std::io::Error> {
+        let file = BufReader::new(file);
+        let mut stream = ReadStream::new(file.compat(), ReaderOptions::new());
+        let mut index = 0;
 
-        // Get the offset from seeking to the end of the file.
-        let offset = match file.seek(SeekFrom::End(seek_from)).await {
-            // If seek fails its because we tried to index before the front.
-            Err(_) => return Ok((0, 0)),
-            Ok(sz) => sz + 8
-        };
-        let index = file.read_u64().await?;
-        Ok((index, offset))
+        while let Some(message_result) = stream.next().await {
+            let message = match message_result {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let entry = message.get_root::<disk_entry::Reader>()
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Failed to create message root"
+                    )
+                })?;
+            index = entry.get_index();
+        }
+
+        Ok(index)
     }
 
     async fn write_lock(base_dir: &Path) -> Result<(), std::io::Error> {
@@ -134,7 +130,6 @@ impl DurableQueueWriter {
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
             log_file,
-            current_offset: 0,
             index: 0,
             queue,
         })
@@ -142,7 +137,6 @@ impl DurableQueueWriter {
 
     pub async fn from_path(base_dir: &Path, queue: broadcast::Sender<Entry>) -> Result<Self, std::io::Error> {
         Self::write_lock(base_dir).await?;
-
         let current_segment = Self::find_max_index(base_dir).await?.unwrap_or(0);
         let log_path = base_dir.join(format!("{}.{}", current_segment, LOG_EXT));
         let mut log_file = OpenOptions::new()
@@ -151,13 +145,12 @@ impl DurableQueueWriter {
             .append(true)
             .open(log_path)
             .await?;
-        let (current_offset, index) = Self::read_last_offset(&mut log_file).await?;
+        let index = Self::read_last_index(&mut log_file).await?;
         let log_file = BufWriter::new(log_file);
 
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
             log_file,
-            current_offset,
             index,
             queue,
         })
@@ -167,21 +160,24 @@ impl DurableQueueWriter {
         self.index
     }
 
-    async fn inner_push<'a>(&mut self, entry: &'a DiskEntrySer<'a>) -> Result<(), std::io::Error> {
-        let serialized = serde_cbor::to_vec(entry).map_err(|e|
-            std::io::Error::new(std::io::ErrorKind::Other,
-                                format!("Serialization error: {:?}", e))
-        )?;
-        let len = serialized.len();
+    async fn disk_push<'a>(&mut self, now: i64, payload: &[u8]) -> Result<(), std::io::Error> {
+        let mut hasher = Hasher::new();
+        hasher.update(payload);
+        let hash = hasher.finalize();
 
-        self.current_offset += len as u64;
-
-        let ser_len = len.to_be_bytes();
-        let ser_index = self.index.to_be_bytes();
-
-        self.log_file.write_all(&ser_len).await?;
-        self.log_file.write_all(&serialized).await?;
-        self.log_file.write_all(&ser_index).await?;
+        let mut message = Builder::new_default();
+        let mut entry = message.init_root::<disk_entry::Builder>();
+        entry.set_index(self.index);
+        entry.set_time(now);
+        entry.set_hash(hash);
+        entry.set_payload(payload);
+        serialize::write_message((&mut self.log_file).compat_write(), &message)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Serialization error: {:?}", e))
+            })?;
         self.log_file.flush().await?;
 
         Ok(())
@@ -193,20 +189,7 @@ impl DurableQueueWriter {
 
     pub async fn push(&mut self, payload: &[u8]) -> Result<(), std::io::Error> { 
         let now = Utc::now().timestamp();
-        let entry = DiskEntrySer{payload, hash: [0; 20], time: now};
-        self.inner_push(&entry).await?;
-        self.queue_push(now, payload);
-        self.index += 1;
-        Ok(())
-    }
-
-    pub async fn push_with_hash(&mut self, payload: &[u8]) -> Result<(), std::io::Error> {
-        let now = Utc::now().timestamp();
-        let mut hasher = Sha1::new();
-        hasher.update(payload);
-        let hash = hasher.finalize();
-        let entry = DiskEntrySer{payload, hash: hash.into(), time: now};
-        self.inner_push(&entry).await?;
+        self.disk_push(now, payload).await?;
         self.queue_push(now, payload);
         self.index += 1;
         Ok(())
@@ -215,12 +198,11 @@ impl DurableQueueWriter {
 
 
 pub struct DurableQueueReader {
-    log_file: BufReader<File>,
+    base_dir: PathBuf,
+    log_file: Compat<BufReader<File>>,
 
     index: u64,
     memory_index: u64,
-    last_read_offset: usize,
-
     queue: broadcast::Receiver<Entry>
 }
 
@@ -238,10 +220,10 @@ impl DurableQueueReader {
         let log_file = BufReader::new(log_file);
 
         Ok(Self {
-            log_file,
+            base_dir: base_dir.to_path_buf(),
+            log_file: log_file.compat(),
             index: start_index,
             memory_index,
-            last_read_offset: 0,
             queue
         })
     }
@@ -256,15 +238,8 @@ impl DurableQueueReader {
             return Ok(entry);
         }
 
-        Ok(match self.read_from_log().await? {
-            Some((i, v)) => {
-                self.index = i;
-                Entry {
-                    index: i,
-                    time: v.time,
-                    payload: v.payload
-                }
-            }
+        Ok(match self.read_from_log().await {
+            Some(v) => v,
             None => {
                 // Ran out of data, read from the memory queue.
                 self.memory_index = self.index;
@@ -278,44 +253,38 @@ impl DurableQueueReader {
         })
     }
 
-    async fn read_from_log(&mut self) -> Result<Option<(u64, DiskEntry)>, std::io::Error> {
-        let len = match self.log_file.read_u64().await {
-            Ok(v) => v as usize,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Ok(None);
-                } else {
-                    return Err(e);
-                }
-            }
+    async fn read_from_log(&mut self) -> Option<Entry> {
+        let message_result = serialize::read_message(
+            &mut self.log_file,
+            ReaderOptions::new()
+        ).await;
+
+        let reader = match message_result {
+            Ok(r) => r,
+            Err(_) => return None,
         };
-        let mut contents = vec![0u8; len];
-        self.log_file.read_exact(&mut contents).await?;
-        let index = self.log_file.read_u64().await?;
-        let entry_size = std::mem::size_of::<u64>();
-        self.last_read_offset += entry_size * 2 + len;
+        let message = reader.get_root::<disk_entry::Reader>().ok()?;
 
-        let entry: DiskEntry = serde_cbor::from_slice(&contents).map_err(|e|
-            std::io::Error::new(std::io::ErrorKind::Other,
-                                format!("DeserializationError: {:?}", e))
-        )?;
+        let index = message.get_index();
+        let time = message.get_time();
+        let hash = message.get_hash();
+        let payload = message.get_payload().ok()?;
 
-        if entry.hash != [0; 20] {
-            let mut hasher = Sha1::new();
-            hasher.update(&entry.payload);
-            let hash: [u8; 20] = hasher.finalize().into();
-            if entry.hash != hash {
-                // TODO: This should probably just drop hashes from the stream.
-                return Err(
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Invalid hash!"
-                    )
-                );
+        if hash != 0 {
+            let mut hasher = Hasher::new();
+            hasher.update(&payload);
+            let new_hash  = hasher.finalize();
+            if hash != new_hash {
+                warn!("Hash failed for message in {:?} indexed {}", self.base_dir, index);
+                return None;
             }
         }
 
-        Ok(Some((index, entry)))
+        Some(Entry{
+            index,
+            time,
+            payload: payload.to_vec()
+        })
     }
 }
 
@@ -363,18 +332,5 @@ mod tests {
         assert_eq!(payload2, entry.payload);
         let entry = block_on(reader.read_next()).expect("Failed to read from queue");
         assert_eq!(payload3, entry.payload);
-    }
-
-    #[test]
-    fn test_push_with_hash_and_verify() {
-        let dir = setup();
-        let base_dir = dir.path().to_path_buf();
-        let (mut writer, mut reader) = block_on(create_durable_queue(&base_dir, "test_push_with_hash_and_verify")).expect("Failed to create queue");
-        reader.memory_index = 1;
-
-        let payload = b"Test Payload".to_vec();
-        block_on(writer.push_with_hash(&payload)).expect("Failed to push to queue");
-        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
-        assert_eq!(payload, entry.payload);
     }
 }
