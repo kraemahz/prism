@@ -1,2 +1,3 @@
-/target
+prism_server/target
+prism_client/target
 /temp
