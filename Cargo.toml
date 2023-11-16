@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "prism_server",
+    "prism_schema",
+    "prism_client"
+]

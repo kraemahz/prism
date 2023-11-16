@@ -13,7 +13,7 @@ use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::broadcast;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::log_capnp::disk_entry;
+use prism_schema::log::disk_entry;
 
 
 #[derive(Clone)]

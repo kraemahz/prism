@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use prism::queue::{DurableQueueWriter, DurableQueueReader, create_durable_queue};
+use prism_server::queue::{DurableQueueWriter, DurableQueueReader, create_durable_queue};
 use tempfile::{tempdir, TempDir};
 use tokio::runtime::Runtime;
 use std::rc::Rc;

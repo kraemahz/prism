@@ -1,0 +1,10 @@
+[package]
+name = "prism_schema"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+capnp = "0.18"
+
+[build-dependencies]
+capnpc = "0.18.0"

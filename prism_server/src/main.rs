@@ -1,4 +1,4 @@
-use prism::queue::create_durable_queue;
+use prism_server::queue::create_durable_queue;
 use std::path::Path;
 
 
