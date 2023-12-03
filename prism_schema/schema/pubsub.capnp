@@ -1,12 +1,13 @@
 @0xc7d34a1f82bf2a86;
 
-struct Capture {
-    beam @0 :Text;
-}
-
-struct Emit {
+struct Emission {
     beam @0 :Text;
     payload @1 :Data;
+}
+
+struct Beam {
+    name @0: Text;
+    photons @1: List(Photon);
 }
 
 struct Photon {
@@ -15,23 +16,18 @@ struct Photon {
     payload @2 :Data;
 }
 
-struct Transmissions {
-    beams @0 :List(Text);
+struct ClientGreeting {
+    id @0 :UInt64;
 }
 
 struct ClientMessage {
+    emission @0 :Emission;
+}
+
+struct ServerGreeting {
     id @0 :UInt64;
-    command: union {
-      capture @1 :Capture;
-      emit @2 :Emit;
-      transmissions @3 :Void;
-    }
 }
 
 struct ServerMessage {
-    message: union {
-      id @0 :UInt64;
-      photon @1 :Photon;
-      transmissions @2 :Transmissions;
-    }
+    beams @0 :List(Beam);
 }

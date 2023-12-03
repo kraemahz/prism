@@ -18,7 +18,7 @@ async fn push_benchmark(writer: Rc<RefCell<DurableQueueWriter>>) {
 
 async fn read_benchmark(writer: Rc<RefCell<DurableQueueWriter>>, reader: Rc<RefCell<DurableQueueReader>>) {
     writer.borrow_mut().push(&PAYLOAD).await.expect("Failed to push to queue");
-    reader.borrow_mut().read_next().await.expect("Faield to read message");
+    reader.borrow_mut().next().await.expect("Faield to read message");
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
