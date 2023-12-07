@@ -6,13 +6,11 @@ use capnp::message::{Builder, ReaderOptions, HeapAllocator};
 use futures_util::{SinkExt, stream::{StreamExt, SplitSink, SplitStream}};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_websockets::{Error, Message, ServerBuilder, WebsocketStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::beam::BeamServerHandle;
-use crate::exchange::{BeamRequest, BeamResponse, BeamChannel, ClientId};
+use crate::beam::{BeamServerHandle, BeamsTable, ClientId};
 use crate::queue::{Entry, Photon, DurableQueueWriter};
-use crate::router::{Router, BeamsTable};
 use crate::util::ShutdownSender;
 use prism_schema::{
     ClientRequest,
@@ -26,7 +24,6 @@ use prism_schema::{
         server_message
     }
 };
-
 
 fn write_to_message(message: Builder<HeapAllocator>) -> Message
 {
@@ -67,7 +64,6 @@ async fn send_events_task(mut entry_rx: mpsc::UnboundedReceiver<(Arc<str>, Entry
     let mut messages = Vec::with_capacity(WS_LIMIT);
     while entry_rx.recv_many(&mut messages, WS_LIMIT).await > 0 {
         send_events(&mut messages, &ws_tx).await;
-        tracing::debug!("Send events");
     }
 }
 
@@ -91,26 +87,12 @@ async fn send_messages_task(client_addr: String,
         if ws_sink.send(message).await.is_err() {
             break;
         }
-        tracing::debug!("Send message");
     }
     tracing::info!("Client {} stream disconnected", client_addr);
 }
 
-
-#[tracing::instrument]
 #[inline]
-fn capture_request(client_id: ClientId, caps: Vec<(i64, Arc<str>)>) -> Vec<BeamRequest> {
-    caps.into_iter().map(|(index, beam)| BeamRequest::Subscribe(
-        client_id,
-        beam,
-        if index < 0 {None} else {Some(index as u64)}
-    )).collect()
-}
-
-
-#[inline]
-fn get_handle(beam_name: capnp::text::Reader, beams_table: &Arc<Mutex<BeamsTable>>) -> Arc<str> {
-    let beam_name = beam_name.to_string().unwrap();
+fn get_handle(beam_name: String, beams_table: &Arc<Mutex<BeamsTable>>) -> Arc<str> {
     let mut table = beams_table.lock().unwrap();
     table.get_or_insert(&beam_name)
 }
@@ -122,7 +104,7 @@ async fn send_entry(client_id: ClientId,
                     beam_server: &BeamServerHandle,
                     writers: &mut HashMap<Arc<str>, DurableQueueWriter>) {
     if let Some(writer) = writers.get_mut(&entry.beam) {
-        writer.push(&entry.payload).await;
+        writer.push(&entry.payload).await.ok();
         return;
     };
 
@@ -130,7 +112,7 @@ async fn send_entry(client_id: ClientId,
     tracing::warn!("{:?} took the slow path on emit of {}, consider using enable",
                    client_id, entry.beam);
 
-    let mut fetch_writer = match beam_server.new_writer(&entry.beam).await {
+    let mut fetch_writer = match beam_server.new_writer(client_id, &entry.beam).await {
         Ok(w) => w,
         Err(err) => {
             tracing::error!("DROPPED PACKET: {:?} failed to create new writer for beam {:?}: {:?}",
@@ -138,29 +120,58 @@ async fn send_entry(client_id: ClientId,
             return;
         }
     };
-    fetch_writer.push(&entry.payload).await;
+    fetch_writer.push(&entry.payload).await.ok();
     writers.insert(entry.beam.clone(), fetch_writer);
 }
 
 
 #[tracing::instrument]
 #[inline]
-async fn send_request(request: BeamRequest,
-                      beam_server: &BeamServerHandle,
-                      ws_tx: &mpsc::Sender<Message>) {
-    let id = 0;
+async fn handle_request(client_id: ClientId,
+                        request: ClientRequest,
+                        beams_table: &Arc<Mutex<BeamsTable>>,
+                        beam_server: &BeamServerHandle,
+                        writers: &mut HashMap<Arc<str>, DurableQueueWriter>,
+                        ws_tx: &mpsc::Sender<Message>) {
 
-    beam_server.send((request, response_tx)).unwrap();
-    tracing::debug!("Request sent");
-    let server_message = match response_rx.await {
-        Ok(BeamResponse::List(list)) => {
-            ServerResponse{ id, rtype: ResponseType::Beams(list)}
-        },
-        _ => {
-            ServerResponse{ id, rtype: ResponseType::Ack}
+    let ClientRequest{id: request_id, rtype} = request;
+    let response_type = match rtype {
+        RequestType::ListBeams => {
+            let beams = beam_server.list_beams().await;
+            let beams: Vec<_> = beams.into_iter().map(|b| b.to_string()).collect();
+            ResponseType::Beams(beams)
+        }
+        RequestType::AddBeam(beam) => {
+            let beam = {
+                let mut table = beams_table.lock().unwrap();
+                table.get_or_insert(&beam)
+            };
+
+            match beam_server.new_writer(client_id, &beam).await {
+                Ok(fetch_writer) => {
+                    writers.insert(beam.clone(), fetch_writer);
+                    ResponseType::Ack
+                },
+                Err(err) => {
+                    ResponseType::Error(err.to_string())
+                }
+            }
+        }
+        RequestType::Subscribe(beam, index) => {
+            let beam = get_handle(beam, &beams_table);
+            beam_server.subscribe(client_id, beam, index).await;
+            ResponseType::Ack
+        }
+        RequestType::Unsubscribe(beam) => {
+            let beam = get_handle(beam, &beams_table);
+            beam_server.unsubscribe(client_id, beam).await;
+            ResponseType::Ack
         }
     };
-    let string = serde_json::to_string(&server_message).unwrap();
+
+    let response = ServerResponse{ id: request_id, rtype: response_type};
+    tracing::debug!("{:?}", response);
+    let string = serde_json::to_string(&response).unwrap();
     let message = Message::text(string);
     ws_tx.send(message).await.unwrap();
 }
@@ -174,7 +185,6 @@ async fn handle_client_message_task(client_id: ClientId,
     let mut writers = HashMap::new();
 
     while let Some(Ok(msg)) = ws_source.next().await {
-        tracing::debug!("New message");
         if msg.is_binary() {
             let buf = msg.into_payload();
             let bytes = buf.to_vec();
@@ -184,8 +194,10 @@ async fn handle_client_message_task(client_id: ClientId,
             let msg = reader.get_root::<client_message::Reader>().unwrap();
             let emission = msg.get_emission().unwrap();
 
-            let beam = get_handle(emission.get_beam().unwrap(), &beams_table);
+            let beam = emission.get_beam().unwrap().to_string().unwrap();
+            let beam = get_handle(beam, &beams_table);
             let payload = emission.get_payload().unwrap().to_vec();
+            tracing::trace!("Entry({})", beam);
             let entry = Photon { beam, payload };
             send_entry(client_id, entry, &beam_server, &mut writers).await;
         }
@@ -197,9 +209,13 @@ async fn handle_client_message_task(client_id: ClientId,
                     break;
                 }
             };
-            let ClientRequest{id, rtype} = client_request;
-            let request = BeamRequest::from(client_id, &beams_table, rtype);
-            send_request(request, &beam_server, &ws_tx).await;
+            tracing::debug!("{:?}", client_request);
+            handle_request(client_id,
+                           client_request,
+                           &beams_table,
+                           &beam_server,
+                           &mut writers,
+                           &ws_tx).await;
         }
         else if msg.is_ping() {
             let payload = msg.into_payload();
@@ -233,17 +249,19 @@ async fn send_server_greeting(
         ws_sink: &mut SplitSink<WebsocketStream<TcpStream>, Message>,
         client_id: ClientId) -> Result<(), Error> {
 
-    let mut message = Builder::new(HeapAllocator::new());
-    let mut server_msg = message.init_root::<server_greeting::Builder>();
-    server_msg.set_id(client_id.0);
-    let message = write_to_message(message);
+    let message = {
+        let mut message = Builder::new(HeapAllocator::new());
+        let mut server_msg = message.init_root::<server_greeting::Builder>();
+        server_msg.set_id(client_id.0);
+        write_to_message(message)
+    };
     ws_sink.send(message).await?;
 
     Ok(())
 }
 
 
-pub fn init_client(sent_id: u64, clients: &mut HashSet<u64>, beam_server: &BeamServerHandle) -> (ClientId, mpsc::UnboundedReceiver<(Arc<str>, Entry)>) {
+pub async fn init_client(sent_id: u64, clients: &mut HashSet<u64>, beam_server: &BeamServerHandle) -> (ClientId, mpsc::UnboundedReceiver<(Arc<str>, Entry)>) {
     let client_id = if clients.contains(&sent_id) {
         ClientId(sent_id)
     } else {
@@ -252,13 +270,12 @@ pub fn init_client(sent_id: u64, clients: &mut HashSet<u64>, beam_server: &BeamS
         ClientId(rn)
     };
     let (server_tx, server_rx) = mpsc::unbounded_channel(); 
-    beam_server.add_client(client_id, server_tx);
+    beam_server.add_client(client_id, server_tx).await;
     (client_id, server_rx)
 }
 
 
 pub async fn run_web_server(addr: &str,
-                            router: Arc<Mutex<Router>>,
                             beams_table: Arc<Mutex<BeamsTable>>,
                             beam_server: BeamServerHandle,
                             shutdown: ShutdownSender) -> Result<JoinHandle<Result<(), Error>>, Error> {
@@ -272,7 +289,7 @@ pub async fn run_web_server(addr: &str,
             let (mut ws_sink, mut ws_source) = ws_stream.split();
 
             let sent_id = read_greeting(&mut ws_source).await?;
-            let (client_id, entry_rx) = init_client(sent_id, &mut clients, &beam_server);
+            let (client_id, entry_rx) = init_client(sent_id, &mut clients, &beam_server).await;
             send_server_greeting(&mut ws_sink, client_id).await?;
 
             let (ws_tx, ws_rx) = mpsc::channel::<Message>(WS_LIMIT);
@@ -283,7 +300,7 @@ pub async fn run_web_server(addr: &str,
             let beams_table = beams_table.clone();
             tokio::spawn(handle_client_message_task(client_id,
                                                     ws_source,
-                                                    beam_server,
+                                                    beam_server.clone(),
                                                     beams_table,
                                                     ws_tx));
         }

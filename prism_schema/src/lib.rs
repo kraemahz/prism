@@ -12,13 +12,13 @@ pub use crate::pubsub_capnp as pubsub;
 
 pub type Beam = String;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ClientRequest {
     pub id: u64,
     pub rtype: RequestType
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum RequestType {
     AddBeam(Beam),
     ListBeams,
@@ -27,14 +27,15 @@ pub enum RequestType {
 }
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ServerResponse {
     pub id: u64,
     pub rtype: ResponseType
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ResponseType {
     Ack,
+    Error(String),
     Beams(Vec<Beam>),
 }

@@ -1,61 +1,250 @@
 use std::path::PathBuf;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind, Result};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, atomic::Ordering};
 
 use async_recursion::async_recursion;
 use globset::{Glob, GlobSetBuilder, GlobSet};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 
-use crate::exchange::ClientId;
-use crate::router::BeamsTable;
-use crate::queue::{Entry, DurableQueueWriter, DurableQueueReader};
+use crate::queue::{DurableQueueWriter, DurableQueueReader, Entry, NextError};
+pub type ClientSender = mpsc::UnboundedSender<(Arc<str>, Entry)>;
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClientId(pub u64);
+
+#[derive(Clone, Debug)]
+pub struct BeamsTable {
+    table: HashSet<Arc<str>>,
+}
+
+impl BeamsTable {
+    pub fn new() -> Self {
+        Self { table: HashSet::new() }
+    }
+
+    pub fn get_or_insert(&mut self, string: &str) -> Arc<str> {
+        let string = Arc::from(string);
+        match self.table.get(&string) {
+            Some(str) => str.clone(),
+            None => {
+                self.table.insert(string.clone());
+                string
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct BeamServerHandle {
-    beam_server: Arc<Mutex<BeamServer>>
+    beam_server: Arc<AsyncMutex<BeamServer>>
 }
 
 impl BeamServerHandle {
     pub async fn new(base_dir: PathBuf, table: &mut BeamsTable) -> Result<Self> {
         let beam_server = BeamServer::new(base_dir, table).await?;
-        Ok(Self { beam_server: Arc::new(Mutex::new(beam_server)) })
+        Ok(Self { beam_server: Arc::new(AsyncMutex::new(beam_server)) })
     }
 
-    pub async fn new_writer(&self, beam: &Arc<str>) -> Result<DurableQueueWriter> {
-        let mut server = self.beam_server.lock().unwrap();
-        server.new_writer(beam).await
+    pub async fn list_beams(&self) -> Vec<Arc<str>> {
+        let server = self.beam_server.lock().await;
+        tracing::debug!("BeamServer::list_beams()");
+        server.list_beams()
+    }
+
+    pub async fn new_writer(&self, client_id: ClientId, beam: &Arc<str>) -> Result<DurableQueueWriter> {
+        let mut server = self.beam_server.lock().await;
+        tracing::debug!("BeamServer::new_writer({:?})", beam);
+        server.new_writer(client_id, beam).await
     }
 
     pub async fn drop_writer(&self, writer: DurableQueueWriter) {
-        let mut server = self.beam_server.lock().unwrap();
-        server.drop_writer(writer).await;
+        let mut server = self.beam_server.lock().await;
+        tracing::debug!("BeamServer::drop_writer({:?})", writer.beam());
+        server.drop_writer(writer);
     }
 
-    pub fn add_client(&self, client_id: ClientId, sink: mpsc::UnboundedSender<(Arc<str>, Entry)>) {
-        let mut server = self.beam_server.lock().unwrap();
+    pub async fn subscribe(&self, client_id: ClientId, beam: Arc<str>, index: Option<u64>) {
+        let mut server = self.beam_server.lock().await;
+        tracing::debug!("BeamServer::subscribe({:?}, {:?})", client_id, beam);
+        server.subscribe(client_id, beam, index).await;
+    }
+
+    pub async fn unsubscribe(&self, client_id: ClientId, beam: Arc<str>) {
+        let mut server = self.beam_server.lock().await;
+        tracing::debug!("BeamServer::unsubscribe({:?}, {:?})", client_id, beam);
+        server.unsubscribe(client_id, beam);
+    }
+
+    pub async fn add_client(&self, client_id: ClientId, sink: ClientSender) {
+        let mut server = self.beam_server.lock().await;
+        tracing::debug!("BeamServer::add_client({:?})", client_id);
         server.add_client(client_id, sink);
     }
 
-    pub fn drop_client(&self, client_id: ClientId) {
-        let mut server = self.beam_server.lock().unwrap();
+    pub async fn drop_client(&self, client_id: ClientId) {
+        let mut server = self.beam_server.lock().await;
+        tracing::debug!("BeamServer::drop_client({:?})", client_id);
         server.drop_client(client_id);
     }
 }
 
 
-pub enum BeamMessage {
-    NewWriter(Arc<str>),
-    Writer(DurableQueueWriter)
+enum HandleUpdate {
+    Senders(Vec<mpsc::UnboundedSender<(Arc<str>, Entry)>>)
 }
 
 
-pub enum BeamResponse {
-    Writer(DurableQueueWriter)
+#[derive(Debug)]
+pub struct BeamReaderSet {
+    beam: Arc<str>,
+    writer_handles: HashMap<ClientId, (PathBuf, broadcast::Sender<Entry>, Arc<AtomicU64>)>,
+    reader_handles: HashMap<ClientId, mpsc::Sender<HandleUpdate>>,
+    subscriptions: HashMap<ClientId, ClientSender>
+}
+
+
+impl BeamReaderSet {
+    pub fn new(beam: Arc<str>) -> Self {
+        Self { beam,
+               writer_handles: HashMap::new(),
+               reader_handles: HashMap::new(),
+               subscriptions: HashMap::new() }
+    }
+
+    async fn spawn_reader(&mut self, client_id: ClientId, index: u64) -> std::io::Result<()> {
+        let (base_dir, queue, memory_index) = match self.writer_handles.get(&client_id) {
+            Some(wh) => wh,
+            None => return Err(
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Writer was not found"
+                )
+            )
+        };
+        let mut reader = DurableQueueReader::new(
+            self.beam.clone(),
+            base_dir.clone(),
+            queue.subscribe(),
+            index,
+            memory_index.load(Ordering::Acquire)
+        ).await?;
+        let (tx, mut rx) = mpsc::channel(1);
+        self.reader_handles.insert(client_id, tx);
+
+        let beam = self.beam.clone();
+        tracing::debug!("Reader task spawned: {:?} {}", client_id, beam);
+
+        tokio::spawn(async move {
+            let mut senders: Vec<ClientSender> = Vec::new();
+
+            loop {
+                let entry = if reader.cancel_safe() {
+                    tokio::select!(
+                        msg = reader.next() => msg,
+                        update = rx.recv() => {
+                            match update {
+                                Some(HandleUpdate::Senders(v)) => {
+                                    tracing::debug!("Senders update (select): {}", v.len());
+                                    senders.clear();
+                                    senders.extend(v);
+                                }
+                                None => break
+                            }
+                            continue;
+                        }
+                    )
+                } else {
+                    if let Ok(update) = rx.try_recv() {
+                        match update {
+                            HandleUpdate::Senders(v) => {
+                                tracing::debug!("Senders update (interrupt): {}", v.len());
+                                senders.clear();
+                                senders.extend(v);
+                            }
+                        }
+                    }
+                    reader.next().await
+                };
+
+                match entry {
+                    Ok(entry) => {
+                        for send in senders.iter() {
+                            send.send((beam.clone(), entry.clone())).ok();
+                        }
+                    }
+                    Err(NextError::TryAgain) => continue,
+                    Err(NextError::Closed) => {
+                        tracing::info!("Writer stopped");
+                        continue;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    pub async fn add_writer(&mut self, client_id: ClientId, writer: &DurableQueueWriter, index: u64) {
+        let base_dir = writer.base_dir();
+        let queue = writer.queue();
+        let mem_index = writer.index();
+        self.writer_handles.insert(client_id, (base_dir, queue, mem_index));
+
+        if !self.subscriptions.is_empty() {
+            if self.spawn_reader(client_id, index).await.is_err() {
+                tracing::warn!("Reader task spawn failed");
+                return;
+            }
+            let send_vec = self.subscriptions.values().cloned().collect();
+            let reader_handle = self.reader_handles.get(&client_id).unwrap();
+            reader_handle.send(HandleUpdate::Senders(send_vec)).await.ok();
+        }
+    }
+
+    pub async fn subscribe(&mut self, client_id: ClientId, sender: ClientSender, index: Option<u64>) {
+        let was_empty = self.subscriptions.is_empty();
+        self.subscriptions.insert(client_id, sender);
+        if was_empty {
+            tracing::info!("Subscribe starting new tasks (was_empty)");
+            match index {
+                Some(index) => {
+                    let client_ids: Vec<_> = self.writer_handles.keys().copied().collect();
+                    for write_client_id in client_ids {
+                        if self.spawn_reader(write_client_id, index).await.is_err() {
+                            tracing::warn!("Reader task spawn failed");
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    let clients: Vec<_> = self.writer_handles.iter().map(|(w, (_, _, idx))| (*w, idx.clone())).collect();
+                    for (write_client_id,  memory_index) in clients {
+                        let index = memory_index.load(Ordering::Relaxed);
+                        if self.spawn_reader(write_client_id, index).await.is_err() {
+                            tracing::warn!("Reader task spawn failed");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        let send_vec: Vec<_> = self.subscriptions.values().cloned().collect();
+        for reader_handle in self.reader_handles.values() {
+            reader_handle.send(HandleUpdate::Senders(send_vec.clone())).await.ok();
+        }
+    }
+
+    pub fn unsubscribe(&mut self, client_id: ClientId) {
+        self.subscriptions.remove(&client_id);
+        if self.subscriptions.is_empty() {
+            self.reader_handles.clear();
+        }
+    }
 }
 
 
@@ -63,17 +252,23 @@ pub enum BeamResponse {
 pub struct BeamServer {
     base_dir: PathBuf,
     beams: HashMap<Arc<str>, Beam>,
-    clients: HashMap<ClientId, UnboundedSender<(Arc<str> Entry)>>,
+    clients: HashMap<ClientId, mpsc::UnboundedSender<(Arc<str>, Entry)>>,
+    readers: HashMap<Arc<str>, BeamReaderSet>
 }
 
 impl BeamServer {
     pub async fn new(base_dir: PathBuf, table: &mut BeamsTable) -> Result<Self> {
          Ok(Self { base_dir: base_dir.clone(),
                    beams: setup_queues(base_dir, table).await?,
-                   clients: HashMap::new() })
+                   clients: HashMap::new(),
+                   readers: HashMap::new() })
     }
 
-    pub async fn new_writer(&mut self, beam_name: &Arc<str>) -> Result<DurableQueueWriter> {
+    pub fn list_beams(&self) -> Vec<Arc<str>> {
+        self.beams.keys().cloned().collect()
+    }
+
+    pub async fn new_writer(&mut self, client_id: ClientId, beam_name: &Arc<str>) -> Result<DurableQueueWriter> {
        let beam = match self.beams.get_mut(beam_name) {
            Some(beam) => beam,
            None => {
@@ -93,11 +288,14 @@ impl BeamServer {
                return Err(err);
            }
        };
+       let beam_set = self.readers.entry(beam_name.clone())
+            .or_insert_with(|| BeamReaderSet::new(beam_name.clone()));
+       beam_set.add_writer(client_id, &writer, 0).await;
        Ok(writer)
     }
 
-    pub async fn drop_writer(&mut self, writer: DurableQueueWriter) {
-        let beam_name = writer.beam();
+    pub fn drop_writer(&mut self, writer: DurableQueueWriter) {
+       let beam_name = writer.beam();
        let beam = match self.beams.get_mut(&beam_name) {
            Some(beam) => beam,
            None => {
@@ -108,12 +306,33 @@ impl BeamServer {
        beam.reclaim(writer);
     }
 
-    pub fn add_client(&self, client_id: ClientId, sink: mpsc::UnboundedSender<(Arc<str>, Entry)>) {
+    pub fn add_client(&mut self, client_id: ClientId, sink: mpsc::UnboundedSender<(Arc<str>, Entry)>) {
         self.clients.insert(client_id, sink);
     }
 
-    pub fn drop_client(&self, client_id: ClientId) {
+    pub fn drop_client(&mut self, client_id: ClientId) {
         self.clients.remove(&client_id);
+    }
+
+    pub async fn subscribe(&mut self, client_id: ClientId, beam: Arc<str>, index: Option<u64>) {
+        let sender = match self.clients.get(&client_id) {
+            Some(sender) => sender.clone(),
+            None => {
+                tracing::error!("No sender for client {:?}", client_id);
+                return;
+            }
+        };
+        let beam_set = self.readers.entry(beam.clone())
+            .or_insert_with(|| BeamReaderSet::new(beam));
+        beam_set.subscribe(client_id, sender, index).await;
+    }
+
+    pub fn unsubscribe(&mut self, client_id: ClientId, beam: Arc<str>) {
+        let beam_set = match self.readers.get_mut(&beam) {
+            Some(beam_set) => beam_set,
+            None => return
+        };
+        beam_set.unsubscribe(client_id);
     }
 }
 
@@ -273,37 +492,4 @@ pub async fn setup_queues(base_dir: PathBuf, table: &mut BeamsTable) -> Result<H
     }
 
     Ok(queues)
-}
-
-
-pub async fn beam_join(
-    mut reader: DurableQueueReader,
-    beam_messages: Arc<AsyncMutex<HashMap<ClientId, mpsc::UnboundedSender<(Arc<str>, Entry)>>>>,
-    stop: Arc<AtomicBool>,
-) {
-    let beam = reader.beam();
-    loop {
-        {
-            let beam_messages = beam_messages.lock().await;
-            while !stop.load(Ordering::Relaxed) {
-                if let Some(entry) = reader.next().await {
-                    let mut should_break = false;
-                    for beam_message in beam_messages.values() {
-                        if beam_message.send((beam.clone(), entry.clone())).is_err() {
-                            // Kick back out, this channel closed and should be refreshed
-                            should_break = true;
-                        }
-                    }
-                    if should_break {
-                        break
-                    }
-                }
-            }
-        }
-
-        // Here we wait for the bool to be reset by the other side when it's done.
-        while stop.load(Ordering::Relaxed) {
-            tokio::task::yield_now().await;
-        }
-    }
 }
