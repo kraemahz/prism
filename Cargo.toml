@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = [
     "prism_server",
     "prism_schema",

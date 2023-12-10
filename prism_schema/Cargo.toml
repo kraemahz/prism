@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 capnp = "0.18"
+serde = { version = "1.0.192", features = ["derive"] }
 
 [build-dependencies]
 capnpc = "0.18.0"

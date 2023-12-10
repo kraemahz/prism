@@ -1,22 +1,41 @@
 use std::ffi::OsStr;
 use std::fs::remove_file;
+use std::io::Result as IOResult;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use capnp::message::{Builder, ReaderOptions};
-use capnp_futures::{ReadStream, serialize};
+use capnp_futures::serialize;
 use chrono::Utc;
 use crc32fast::Hasher;
-use log::warn;
-use futures_util::StreamExt;
 use tokio::fs::{File, OpenOptions, create_dir, read_dir};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use prism_schema::log::disk_entry;
 
 
-#[derive(Clone)]
+pub const CHANNEL_SIZE: usize = 1_000;
+const LOG_EXT: &str = "tracing";
+
+
+#[derive(Debug)]
+pub enum NextError {
+    TryAgain,
+    Closed
+}
+
+
+#[derive(Clone, Debug)]
+pub struct Photon {
+    pub beam: Arc<str>,
+    pub payload: Vec<u8>
+}
+
+
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub index: u64,
     pub time: i64,
@@ -24,28 +43,14 @@ pub struct Entry {
 }
 
 
-pub async fn create_durable_queue(base_dir: &Path, queue_name: &str) -> Result<(DurableQueueWriter, DurableQueueReader), std::io::Error> {
-    let mut queue_path = PathBuf::from(base_dir);
-    queue_path.push(queue_name);
-    create_dir(&queue_path).await?; 
-    let (broadcast_tx, broadcast_rx) = broadcast::channel(1_000);
-
-    let writer = DurableQueueWriter::create(queue_path.as_path(), broadcast_tx).await?;
-    let reader = DurableQueueReader::new(queue_path.as_path(), broadcast_rx, 0, 0).await?;
-
-    Ok((writer, reader))
-}
-
+#[derive(Debug)]
 pub struct DurableQueueWriter {
+    beam: Arc<str>,
     base_dir: PathBuf,
     log_file: BufWriter<File>,
-
-    index: u64,
+    index: Arc<AtomicU64>,
     queue: broadcast::Sender<Entry>
 }
-
-
-const LOG_EXT: &str = "log";
 
 
 impl Drop for DurableQueueWriter {
@@ -58,7 +63,7 @@ impl Drop for DurableQueueWriter {
 
 impl DurableQueueWriter {
     /// Find the highest index in the directory if it exists.
-    async fn find_max_index(path: &Path) -> Result<Option<u64>, std::io::Error> {
+    async fn find_max_index(path: &Path) -> IOResult<Option<u64>> {
         let mut max_number: Option<u64> = None;
         let mut entries = read_dir(path).await?;
 
@@ -77,30 +82,32 @@ impl DurableQueueWriter {
     }
 
     /// Function to read the last offset from the offset file
-    async fn read_last_index(file: &mut File) -> Result<u64, std::io::Error> {
-        let file = BufReader::new(file);
-        let mut stream = ReadStream::new(file.compat(), ReaderOptions::new());
-        let mut index = 0;
+    async fn read_last_index(log_path: PathBuf) -> IOResult<u64> {
+        let task = tokio::task::spawn_blocking(|| -> IOResult<u64> {
+            let mut log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(log_path)?;
+            let mut file = std::io::BufReader::new(&mut log_file);
+            let mut index = 0;
 
-        while let Some(message_result) = stream.next().await {
-            let message = match message_result {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let entry = message.get_root::<disk_entry::Reader>()
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Failed to create message root"
-                    )
-                })?;
-            index = entry.get_index();
-        }
-
-        Ok(index)
+            while let Ok(message) = capnp::serialize::read_message(&mut file, ReaderOptions::new()) {
+                let entry = message.get_root::<disk_entry::Reader>()
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Failed to create message root"
+                        )
+                    })?;
+                index = entry.get_index();
+            }
+            Ok(index)
+        });
+        task.await.unwrap()
     }
 
-    async fn write_lock(base_dir: &Path) -> Result<(), std::io::Error> {
+    async fn write_lock(base_dir: &Path) -> IOResult<()> {
         let lock_path = base_dir.join("lock");
         let mut lock_file = OpenOptions::new()
             .create_new(true)
@@ -117,7 +124,16 @@ impl DurableQueueWriter {
     }
 
     /// Constructors
-    pub async fn create(base_dir: &Path, queue: broadcast::Sender<Entry>) -> Result<Self, std::io::Error> {
+    pub async fn create_by_beam(base_dir: &Path,
+                                beam: Arc<str>,
+                                partition: u64) -> IOResult<Self> {
+        let mut queue_path = PathBuf::from(base_dir);
+        queue_path.push(format!("{}-{}", beam, partition));
+        create_dir(&queue_path).await?; 
+        DurableQueueWriter::create(beam, queue_path.as_path()).await
+    }
+
+    pub async fn create(beam: Arc<str>, base_dir: &Path) -> IOResult<Self> {
         Self::write_lock(base_dir).await?;
         let log_path = base_dir.join(format!("0.{}", LOG_EXT));
         let log_file = OpenOptions::new()
@@ -126,52 +142,71 @@ impl DurableQueueWriter {
             .open(log_path)
             .await?;
         let log_file = BufWriter::new(log_file);
+        let (queue, _) = broadcast::channel(CHANNEL_SIZE);
 
         Ok(Self {
+            beam,
             base_dir: base_dir.to_path_buf(),
             log_file,
-            index: 0,
+            index: Arc::new(AtomicU64::new(0)),
             queue,
         })
     }
 
-    pub async fn from_path(base_dir: &Path, queue: broadcast::Sender<Entry>) -> Result<Self, std::io::Error> {
-        Self::write_lock(base_dir).await?;
-        let current_segment = Self::find_max_index(base_dir).await?.unwrap_or(0);
-        let log_path = base_dir.join(format!("{}.{}", current_segment, LOG_EXT));
-        let mut log_file = OpenOptions::new()
+    pub fn beam(&self) -> Arc<str> {
+        self.beam.clone()
+    }
+
+    pub fn base_dir(&self) -> PathBuf {
+        self.base_dir.clone()
+    }
+    
+    pub fn queue(&self) -> broadcast::Sender<Entry> {
+        self.queue.clone()
+    }
+
+    pub async fn from_path(dir: PathBuf, beam: Arc<str>) -> IOResult<Self> {
+        Self::write_lock(&dir).await?;
+        let current_segment = Self::find_max_index(&dir).await?.unwrap_or(0);
+        let log_path = dir.join(format!("{}.{}", current_segment, LOG_EXT));
+
+        let log_file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(log_path)
+            .open(log_path.clone())
             .await?;
-        let index = Self::read_last_index(&mut log_file).await?;
+        let index = Self::read_last_index(log_path).await?;
         let log_file = BufWriter::new(log_file);
+        let (queue, _) = broadcast::channel(CHANNEL_SIZE);
 
         Ok(Self {
-            base_dir: base_dir.to_path_buf(),
+            beam,
+            base_dir: dir,
             log_file,
-            index,
+            index: Arc::new(AtomicU64::new(index)),
             queue,
         })
     }
 
-    pub fn index(&self) -> u64 {
-        self.index
+    pub fn index(&self) -> Arc<AtomicU64> {
+        self.index.clone()
     }
 
-    async fn disk_push<'a>(&mut self, now: i64, payload: &[u8]) -> Result<(), std::io::Error> {
+    async fn disk_push<'a>(&mut self, now: i64, payload: &[u8]) -> IOResult<()> {
         let mut hasher = Hasher::new();
-        hasher.update(payload);
+        hasher.update(&payload.as_ref());
         let hash = hasher.finalize();
 
         let mut message = Builder::new_default();
-        let mut entry = message.init_root::<disk_entry::Builder>();
-        entry.set_index(self.index);
-        entry.set_time(now);
-        entry.set_hash(hash);
-        entry.set_payload(payload);
-        serialize::write_message((&mut self.log_file).compat_write(), &message)
+        {
+            let mut entry = message.init_root::<disk_entry::Builder>();
+            entry.set_index(self.index.load(Ordering::Acquire));
+            entry.set_time(now);
+            entry.set_hash(hash);
+            entry.set_payload(&payload.as_ref());
+        }
+        serialize::write_message((&mut self.log_file).compat_write(), message)
             .await
             .map_err(|e| {
                 std::io::Error::new(
@@ -184,20 +219,25 @@ impl DurableQueueWriter {
     }
 
     fn queue_push(&mut self, time: i64, payload: &[u8]) {
-        self.queue.send(Entry{index: self.index, time, payload: payload.to_vec()}).ok();
+        self.queue.send(Entry{index: self.index.load(Ordering::Acquire),
+                              time, 
+                              payload: payload.to_vec()}).ok();
     }
 
-    pub async fn push(&mut self, payload: &[u8]) -> Result<(), std::io::Error> { 
+    pub async fn push(&mut self, payload: &[u8])-> IOResult<()> {
         let now = Utc::now().timestamp();
+        tracing::trace!("Disk push");
         self.disk_push(now, payload).await?;
         self.queue_push(now, payload);
-        self.index += 1;
+        tracing::trace!("Push done");
+        self.index.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
 
 
 pub struct DurableQueueReader {
+    beam: Arc<str>,
     base_dir: PathBuf,
     log_file: Compat<BufReader<File>>,
 
@@ -206,21 +246,22 @@ pub struct DurableQueueReader {
     queue: broadcast::Receiver<Entry>
 }
 
-
 impl DurableQueueReader {
-    pub async fn new(base_dir: &Path,
+    pub async fn new(beam: Arc<str>,
+                     base_dir: PathBuf,
                      queue: broadcast::Receiver<Entry>,
                      start_index: u64,
-                     memory_index: u64) -> Result<Self, std::io::Error> {
+                     memory_index: u64) -> IOResult<Self> {
         let current_segment = 0;  // TODO: Modify segment based on start index. 
 
-        let mut log_path = PathBuf::from(base_dir);
+        let mut log_path = PathBuf::from(&base_dir);
         log_path.push(format!("{}.{}", current_segment, LOG_EXT));
         let log_file = File::open(&log_path).await?;
         let log_file = BufReader::new(log_file);
 
         Ok(Self {
-            base_dir: base_dir.to_path_buf(),
+            beam,
+            base_dir,
             log_file: log_file.compat(),
             index: start_index,
             memory_index,
@@ -228,25 +269,42 @@ impl DurableQueueReader {
         })
     }
 
-    pub async fn read_next(&mut self) -> Result<Entry, std::io::Error> {
+    pub fn beam(&self) -> Arc<str> {
+        self.beam.clone()
+    }
+
+    pub fn cancel_safe(&self) -> bool {
+        self.index >= self.memory_index
+    }
+
+    pub async fn next(&mut self) -> Result<Entry, NextError> {
         if self.index >= self.memory_index {
-            let entry = self.queue.recv().await.map_err(|_|
-                std::io::Error::new(std::io::ErrorKind::NotConnected,
-                "Broadcast has closed"
-            ))?;
+            let entry = match self.queue.recv().await {
+                Ok(entry) => entry,
+                Err(RecvError::Closed) => return Err(NextError::Closed),
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!("Lagged {}", n);
+                    self.memory_index = self.index + n;
+                    return Err(NextError::TryAgain);
+                }
+            };
             self.index = entry.index;
             return Ok(entry);
         }
-
         Ok(match self.read_from_log().await {
             Some(v) => v,
             None => {
                 // Ran out of data, read from the memory queue.
                 self.memory_index = self.index;
-                let entry = self.queue.recv().await.map_err(|_|
-                    std::io::Error::new(std::io::ErrorKind::NotConnected,
-                    "Broadcast has closed"
-                ))?;
+                let entry = match self.queue.recv().await {
+                    Ok(entry) => entry,
+                    Err(RecvError::Closed) => return Err(NextError::Closed),
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!("Lagged {}", n);
+                        self.memory_index = self.index + n;
+                        return Err(NextError::TryAgain);
+                    }
+                };
                 self.index = entry.index;
                 entry
             }
@@ -263,6 +321,7 @@ impl DurableQueueReader {
             Ok(r) => r,
             Err(_) => return None,
         };
+        tracing::debug!("Log file message");
         let message = reader.get_root::<disk_entry::Reader>().ok()?;
 
         let index = message.get_index();
@@ -275,7 +334,7 @@ impl DurableQueueReader {
             hasher.update(&payload);
             let new_hash  = hasher.finalize();
             if hash != new_hash {
-                warn!("Hash failed for message in {:?} indexed {}", self.base_dir, index);
+                tracing::warn!("Hash failed for message in {:?} indexed {}", self.base_dir, index);
                 return None;
             }
         }
@@ -287,6 +346,7 @@ impl DurableQueueReader {
         })
     }
 }
+
 
 
 #[cfg(test)]
@@ -308,8 +368,10 @@ mod tests {
     fn test_queue_creation() {
         let dir = setup();
         let base_dir = dir.path().to_path_buf();
-        let (writer, _reader) = block_on(create_durable_queue(&base_dir, "test_queue")).expect("Failed to create queue");
-        assert_eq!(writer.index(), 0);
+        let writer = block_on(
+            DurableQueueWriter::create_by_beam(&base_dir, Arc::from("test_queue"), 0)
+        ).expect("Failed to create queue");
+        assert_eq!(writer.index().load(Ordering::Relaxed), 0);
         // Additional assertions to validate the state of the writer and reader can be added here.
     }
 
@@ -317,7 +379,15 @@ mod tests {
     fn test_push_and_read() {
         let dir = setup();
         let base_dir = dir.path().to_path_buf();
-        let (mut writer, mut reader) = block_on(create_durable_queue(&base_dir, "test_queue")).expect("Failed to create queue");
+        let mut writer = block_on(
+            DurableQueueWriter::create_by_beam(&base_dir, Arc::from("test_queue"), 0)
+        ).expect("Failed to create queue");
+
+        let beam = writer.beam();
+        let queue = writer.queue();
+        let mut reader = block_on(
+            DurableQueueReader::new(beam, base_dir, queue.subscribe(), 0, 0)
+        ).expect("Reader creation");
 
         let payload1 = b"Hello, World! 1".to_vec();
         block_on(writer.push(&payload1)).expect("Failed to push to queue");
@@ -326,11 +396,11 @@ mod tests {
         let payload3 = b"Hello, World! 3".to_vec();
         block_on(writer.push(&payload3)).expect("Failed to push to queue");
 
-        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
+        let entry = block_on(reader.next()).expect("Failed to read from queue");
         assert_eq!(payload1, entry.payload);
-        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
+        let entry = block_on(reader.next()).expect("Failed to read from queue");
         assert_eq!(payload2, entry.payload);
-        let entry = block_on(reader.read_next()).expect("Failed to read from queue");
+        let entry = block_on(reader.next()).expect("Failed to read from queue");
         assert_eq!(payload3, entry.payload);
     }
 }
