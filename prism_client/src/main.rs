@@ -1,5 +1,25 @@
-use prism_client::run_client;
+use prism_client::Client;
+use http::Uri;
 
+
+async fn run_client(addr: &str) -> std::io::Result<()> {
+    let uri = addr.parse::<Uri>().unwrap();
+    let mut client = Client::connect(uri).await.map_err(|_|
+        std::io::Error::new(std::io::ErrorKind::Other, "Connection failure"))?;
+
+    let mut messages = client.get_message_rx().unwrap();
+    tokio::task::spawn(async move {
+        while let Some(message) = messages.recv().await {
+            println!("Wavelet {} (n_messages: {})", message.beam, message.photons.len());
+        }
+    });
+
+    client.subscribe("beam1".to_string(), None).await.unwrap();
+    let payload = vec![0,1,2,3];
+    loop {
+        client.emit("beam1".to_string(), payload.clone()).await.unwrap();
+    }
+}
 
 fn setup_tracing() {
     let subscriber = tracing_subscriber::fmt()
