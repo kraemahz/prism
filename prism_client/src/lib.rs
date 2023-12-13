@@ -62,6 +62,12 @@ fn emit_message(beam: String, payload: Vec<u8>) -> Message {
     write_to_message(message)
 }
 
+fn add_beam_message(id: u64, beam: Beam) -> Message {
+    let rtype = RequestType::AddBeam(beam);
+    let msg = ClientRequest{id, rtype};
+    Message::text(serde_json::to_string(&msg).unwrap())
+}
+
 fn transmissions_message(id: u64) -> Message {
     let rtype = RequestType::ListBeams;
     let msg = ClientRequest{id, rtype};
@@ -215,6 +221,28 @@ impl Client {
         (id, rx)
     }
 
+    pub async fn add_beam<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
+        let (id, rx) = self.next_message();
+        self.write.send(add_beam_message(id, beam.into())).await
+            .map_err(|_| ClientError::Disconnected)?;
+        let response = rx.await;
+
+        match response {
+            Ok(ResponseType::Beams(_)) => {
+                Err(ClientError::UnexpectedMessage)
+            }
+            Ok(ResponseType::Ack) => {
+                Ok(())
+            }
+            Ok(ResponseType::Error(err)) => {
+                Err(ClientError::ErrorResult(err))
+            }
+            Err(_) => {
+                Err(ClientError::Disconnected)
+            }
+        }
+    }
+
     pub async fn transmissions(&mut self) -> Result<Vec<Beam>, ClientError> {
         let (id, rx) = self.next_message();
         self.write.send(transmissions_message(id)).await
@@ -238,9 +266,9 @@ impl Client {
         }
     }
 
-    pub async fn subscribe(&mut self, beam: Beam, index: Option<u64>) -> Result<(), ClientError> {
+    pub async fn subscribe<B: Into<Beam>>(&mut self, beam: B, index: Option<u64>) -> Result<(), ClientError> {
         let (id, rx) = self.next_message();
-        self.write.send(sub_message(id, beam, index)).await
+        self.write.send(sub_message(id, beam.into(), index)).await
             .map_err(|_| ClientError::Disconnected)?;
         let response = rx.await;
         match response {
@@ -259,9 +287,9 @@ impl Client {
         }
     }
 
-    pub async fn unsubscribe(&mut self, beam: Beam) -> Result<(), ClientError> {
+    pub async fn unsubscribe<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
         let (id, rx) = self.next_message();
-        self.write.send(unsub_message(id, beam)).await
+        self.write.send(unsub_message(id, beam.into())).await
             .map_err(|_| ClientError::Disconnected)?;
         let response = rx.await;
         match response {
