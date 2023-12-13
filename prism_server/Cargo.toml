@@ -12,14 +12,11 @@ futures-util = { version = "0.3.29", features = ["tokio-io"] }
 prism_schema = { path = "../prism_schema" }
 rustls = "0.21.8"
 serde = { version = "1.0.192", features = ["derive"] }
-serde_bytes = "0.11.12"
 serde_json = "1.0.108"
 tokio = { version = "1.34.0", features = ["full", "tracing"] }
 tokio-rustls = "0.24.1"
 tokio-websockets = { version = "0.4.0", features = ["rustls-native-roots", "server"] }
 tokio-util = { version = "0.7.10", features = ["compat"] }
-http = "1.0.0"
-anymap = "0.12.1"
 bytes = "1.5.0"
 globset = "0.4.14"
 async-recursion = "1.0.5"
