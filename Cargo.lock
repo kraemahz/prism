@@ -120,7 +120,7 @@ dependencies = [
  "bitflags 1.3.2",
  "bytes 1.5.0",
  "futures-util",
- "http 0.2.11",
+ "http",
  "http-body",
  "hyper",
  "itoa",
@@ -146,7 +146,7 @@ dependencies = [
  "async-trait",
  "bytes 1.5.0",
  "futures-util",
- "http 0.2.11",
+ "http",
  "http-body",
  "mime",
  "rustversion",
@@ -659,7 +659,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
- "http 0.2.11",
+ "http",
  "indexmap 2.1.0",
  "slab",
  "tokio",
@@ -716,24 +716,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "http"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b32afd38673a8016f7c9ae69e5af41a58f81b1d31689040f2f1959594ce194ea"
-dependencies = [
- "bytes 1.5.0",
- "fnv",
- "itoa",
-]
-
-[[package]]
 name = "http-body"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5f38f16d184e36f2408a55281cd658ecbd3ca05cce6d6510a176eca393e26d1"
 dependencies = [
  "bytes 1.5.0",
- "http 0.2.11",
+ "http",
  "pin-project-lite",
 ]
 
@@ -766,7 +755,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2",
- "http 0.2.11",
+ "http",
  "http-body",
  "httparse",
  "httpdate",
@@ -1147,9 +1136,8 @@ version = "0.1.0"
 dependencies = [
  "bytes 1.5.0",
  "capnp",
- "capnp-futures",
  "futures-util",
- "http 0.2.11",
+ "http",
  "prism_schema",
  "rustls",
  "serde",
@@ -1184,12 +1172,10 @@ dependencies = [
  "criterion",
  "futures-util",
  "globset",
- "http 1.0.0",
  "prism_schema",
  "rand",
  "rustls",
  "serde",
- "serde_bytes",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1523,15 +1509,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_bytes"
-version = "0.11.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab33ec92f677585af6d88c65593ae2375adde54efdbf16d597f2cbc7a6d368ff"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "serde_derive"
 version = "1.0.193"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1767,7 +1744,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "getrandom",
- "http 0.2.11",
+ "http",
  "httparse",
  "ring 0.16.20",
  "rustls-native-certs",
@@ -1788,7 +1765,7 @@ dependencies = [
  "base64",
  "bytes 1.5.0",
  "h2",
- "http 0.2.11",
+ "http",
  "http-body",
  "hyper",
  "hyper-timeout",
