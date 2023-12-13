@@ -252,6 +252,7 @@ impl DurableQueueReader {
                      queue: broadcast::Receiver<Entry>,
                      start_index: u64,
                      memory_index: u64) -> IOResult<Self> {
+        // TODO: Rollover
         let current_segment = 0;  // TODO: Modify segment based on start index. 
 
         let mut log_path = PathBuf::from(&base_dir);
@@ -385,8 +386,9 @@ mod tests {
 
         let beam = writer.beam();
         let queue = writer.queue();
+        let reader_dir = writer.base_dir();
         let mut reader = block_on(
-            DurableQueueReader::new(beam, base_dir, queue.subscribe(), 0, 0)
+            DurableQueueReader::new(beam, reader_dir, queue.subscribe(), 0, 0)
         ).expect("Reader creation");
 
         let payload1 = b"Hello, World! 1".to_vec();
