@@ -280,8 +280,8 @@ impl Client {
         }
     }
 
-    pub async fn emit(&mut self, beam: Beam, data: Vec<u8>) -> Result<(), ClientError> {
-        self.write.send(emit_message(beam, data)).await.map_err(|_| ClientError::Disconnected)
+    pub async fn emit<B: Into<Beam>>(&mut self, beam: B, data: Vec<u8>) -> Result<(), ClientError> {
+        self.write.send(emit_message(beam.into(), data)).await.map_err(|_| ClientError::Disconnected)
     }
 
     pub fn get_message_rx(&mut self) -> Option<mpsc::Receiver<Wavelet>> {
