@@ -1,13 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::thread::spawn as spawn_thread;
 
 use bytes::BytesMut;
 use capnp::message::{Builder, ReaderOptions, HeapAllocator};
 use capnp::serialize;
-use futures_util::stream::SplitSink;
+use futures_util::Future;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, stream::StreamExt};
 use http::Uri;
 use tokio::net::TcpStream;
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{oneshot, mpsc};
 use tokio::task::{spawn, JoinHandle};
 use tokio_websockets::{ClientBuilder, MaybeTlsStream, Message, WebsocketStream, Error as WSError};
@@ -107,97 +111,303 @@ pub struct Wavelet {
 }
 
 
-const CLIENT_MESSAGE_BUFFER: usize = 1024;
+type Sink = SplitSink<WebsocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type Stream = SplitStream<WebsocketStream<MaybeTlsStream<TcpStream>>>;
 
+pub async fn connect(uri: Uri) -> Result<(u64, Sink, Stream), ClientError> {
+    let (client, _) = ClientBuilder::from_uri(uri).connect().await
+        .map_err(|_| ClientError::ConnectionFailed)?;
+    let (mut write, mut read) = client.split();
+    write.send(greeting()).await.map_err(|_| ClientError::ConnectionFailed)?;
 
-pub struct Client {
-    client_id: u64,  // TODO: reconnect
-    cmd_id: u64,
-    write: SplitSink<WebsocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    beams: HashSet<Beam>,
-    read_task: JoinHandle<Result<(), WSError>>,
-    messages: Option<mpsc::Receiver<Wavelet>>,
-    responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>>,
+    // Handle server messages and client ID
+    let client_id = if let Some(message) = read.next().await {
+        let data = message.unwrap().into_payload();
+        let reader = serialize::read_message(
+            data.as_ref(),
+            ReaderOptions::default()
+        ).map_err(|_|
+            ClientError::UnexpectedMessage)?;
+        let greeting = reader.get_root::<server_greeting::Reader>()
+            .map_err(|_| ClientError::UnexpectedMessage)?;
+
+        // Extract client ID from server_message
+        greeting.get_id()
+    } else {
+        return Err(ClientError::UnexpectedMessage);
+    };
+    tracing::info!("AsyncClient: {:?}", client_id);
+    Ok((client_id, write, read))
 }
 
+fn inner_read_loop<F, G>(message: Message, response_fn: &F, message_fn: &G) -> Result<(), WSError>
+    where F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
+          G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
+{
+    let mut wavelets = vec![];
 
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.read_task.abort();
+    if message.is_binary() {
+        let data = message.into_payload();
+        let reader = serialize::read_message(
+            data.as_ref(),
+            ReaderOptions::default()
+        ).unwrap();
+        let server_message = reader.get_root::<server_message::Reader>().unwrap();
+        let beams = server_message.get_beams().unwrap();
+        for beam in beams {
+            let beam_name = beam.get_name().unwrap().to_string().unwrap();
+            tracing::trace!("Beam: {}", beam_name);
+            let photons = beam.get_photons().unwrap();
+            let mut wav_vec = vec![];
+            for photon in photons {
+                let index = photon.get_index();
+                let time = photon.get_time();
+                let payload = photon.get_payload().unwrap();
+                tracing::trace!("Index: {}, Time: {}, Data: {:?}", index, time, payload);
+                wav_vec.push(Photon{index, time, payload: payload.to_vec()});
+            }
+            wavelets.push(Wavelet{beam: beam_name, photons: wav_vec});
+        }
+    } else if message.is_text() {
+        let data = message.as_text().unwrap();
+        let ServerResponse{id, rtype} = serde_json::from_str(data).unwrap();
+        if let Err(_) = response_fn(id, rtype) {
+            return Err(WSError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "response_fn"
+                )
+            ));
+        }
+    }
+    for wavelet in wavelets {
+        if let Err(_) = message_fn(wavelet) {
+            return Err(WSError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "message_fn"
+                )
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub async fn read_loop<F, G>(mut read: Stream,
+                             response_fn: F,
+                             message_fn: G) -> Result<(), WSError>
+    where F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
+          G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
+{
+    while let Some(message) = read.next().await {
+        let message = message?;
+        if inner_read_loop(message, &response_fn, &message_fn).is_err() {
+            break;
+        }
+    }
+    tracing::info!("Exit read thread");
+    Ok::<_, WSError>(())
+}
+
+pub fn beam_result(rtype: ResponseType,
+                   all_beams: &mut HashSet<Beam>)
+    -> Result<Vec<Beam>, ClientError>
+{
+    match rtype {
+        ResponseType::Beams(beams) => {
+            all_beams.extend(beams);
+            Ok(all_beams.iter().cloned().collect())
+        }
+        ResponseType::Ack => Err(ClientError::UnexpectedMessage),
+        ResponseType::Error(err) => Err(ClientError::ErrorResult(err)),
     }
 }
 
+pub fn ack_result(rtype: ResponseType) -> Result<(), ClientError> {
+    match rtype {
+        ResponseType::Beams(_) => Err(ClientError::UnexpectedMessage),
+        ResponseType::Ack => Ok(()),
+        ResponseType::Error(err) => Err(ClientError::ErrorResult(err)),
+    }
+}
+
+pub struct Client {
+    msg_id: u64,
+    message_into: std::sync::mpsc::SyncSender<(Option<u64>, Message)>,
+    response_from: std::sync::mpsc::Receiver<ResponseType>,
+    beams: HashSet<Beam>
+}
 
 impl Client {
-    pub async fn connect(uri: Uri) -> Result<Self, ClientError> {
-        let (client, _) = ClientBuilder::from_uri(uri).connect().await
-            .map_err(|_| ClientError::ConnectionFailed)?;
-        let (mut write, mut read) = client.split();
-        write.send(greeting()).await.map_err(|_| ClientError::ConnectionFailed)?;
+    pub fn connect<F>(uri: Uri, wavelet_fn: F) -> Self
+        where F: Fn(Wavelet) -> Result<(), Wavelet> + Send + Sync + 'static
+    {
+        let (message_into, message_from) = std::sync::mpsc::sync_channel(1);
+        let (response_into, response_from) = std::sync::mpsc::channel();
 
-        // Handle server messages and client ID
-        let client_id = if let Some(message) = read.next().await {
-            let data = message.unwrap().into_payload();
-            let reader = serialize::read_message(
-                data.as_ref(),
-                ReaderOptions::default()
-            ).map_err(|_|
-                ClientError::UnexpectedMessage)?;
-            let greeting = reader.get_root::<server_greeting::Reader>()
-                .map_err(|_| ClientError::UnexpectedMessage)?;
+        spawn_thread(move || {
+            let rt = RuntimeBuilder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                // TODO: Reconnect
+                let (_client_id, mut write, read) = match connect(uri).await {
+                    Ok(result) => result,
+                    Err(_) => return
+                };
+                let responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>> = Arc::new(Mutex::new(HashMap::new()));
+                let read_responses = responses.clone();
 
-            // Extract client ID from server_message
-            greeting.get_id()
-        } else {
-            return Err(ClientError::UnexpectedMessage);
-        };
-        tracing::info!("Client: {:?}", client_id);
-        let (tx_messages, rx_messages) = mpsc::channel(CLIENT_MESSAGE_BUFFER);
+                spawn(async move {
+                    read_loop(
+                        read,
+                        move |id, rtype| {
+                            if let Some(tx) = read_responses.lock().unwrap().remove(&id) {
+                                tx.send(rtype).ok();
+                            };
+                            Ok(())
+                        },
+                        |wavelet| wavelet_fn(wavelet).map_err(|w| SendError(w))
+                    ).await
+                });
+
+                while let Ok((id, msg)) = message_from.recv() {
+                    let (tx, rx) = oneshot::channel();
+
+                    match id {
+                        Some(id) => {
+                            responses.lock().unwrap().insert(id, tx);
+                            if write.send(msg).await.is_err() {
+                                break;
+                            }
+                            let response = rx.await;
+                            if let Ok(response) = response {
+                                if response_into.send(response).is_err() {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        None => {
+                            if write.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        Self{msg_id: 0, message_into, response_from, beams: HashSet::new()}
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.msg_id;
+        self.msg_id += 1;
+        id
+    }
+
+    pub fn add_beam<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
+        let id = self.next_id();
+        let msg = add_beam_message(id, beam.into());
+        if self.message_into.send((Some(id), msg)).is_err() {
+            return Err(ClientError::Disconnected);
+        }
+        match self.response_from.recv() {
+            Ok(response) => ack_result(response),
+            Err(_) => Err(ClientError::Disconnected)
+        }
+    }
+
+    pub fn transmissions(&mut self) -> Result<Vec<Beam>, ClientError> {
+        let id = self.next_id();
+        let msg = transmissions_message(id);
+        if self.message_into.send((Some(id), msg)).is_err() {
+            return Err(ClientError::Disconnected);
+        }
+        match self.response_from.recv() {
+            Ok(response) => beam_result(response, &mut self.beams),
+            Err(_) => Err(ClientError::Disconnected)
+        }
+    }
+
+    pub fn subscribe<B: Into<Beam>>(&mut self, beam: B, index: Option<u64>) -> Result<(), ClientError> {
+        let id = self.next_id();
+        let msg = sub_message(id, beam.into(), index);
+        if self.message_into.send((Some(id), msg)).is_err() {
+            return Err(ClientError::Disconnected);
+        }
+        match self.response_from.recv() {
+            Ok(response) => ack_result(response),
+            Err(_) => Err(ClientError::Disconnected)
+        }
+    }
+
+    pub fn unsubscribe<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
+        let id = self.next_id();
+        let msg = unsub_message(id, beam.into());
+        if self.message_into.send((Some(id), msg)).is_err() {
+            return Err(ClientError::Disconnected);
+        }
+        match self.response_from.recv() {
+            Ok(response) => ack_result(response),
+            Err(_) => Err(ClientError::Disconnected)
+        }
+    }
+
+    pub fn emit<B: Into<Beam>>(&mut self, beam: B, data: Vec<u8>) -> Result<(), ClientError> {
+        let msg = emit_message(beam.into(), data);
+        if self.message_into.send((None, msg)).is_err() {
+            return Err(ClientError::Disconnected);
+        }
+        Ok(())
+    }
+}
+
+pub struct AsyncClient {
+    client_id: u64,  // TODO: reconnect
+    cmd_id: u64,
+    write: Sink,
+    beams: HashSet<Beam>,
+    read_task: JoinHandle<Result<(), tokio_websockets::Error>>,
+    wavelet_task: JoinHandle<()>,
+    responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>>,
+}
+
+impl Drop for AsyncClient {
+    fn drop(&mut self) {
+        self.read_task.abort();
+        self.wavelet_task.abort();
+    }
+}
+
+impl AsyncClient {
+    pub async fn connect<F, Fut>(uri: Uri, wavelet_fn: F) -> Result<Self, ClientError>
+        where F: Fn(Wavelet) -> Fut + Sync + Send + 'static,
+              Fut: Future<Output=()> + Send
+    {
+        let (client_id, write, read) = connect(uri).await?;
+        let (tx_messages, mut rx_messages) = mpsc::unbounded_channel();
         let responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>> = Arc::new(Mutex::new(HashMap::new()));
         let read_responses = responses.clone();
-
         let read_task = spawn(async move {
-            while let Some(message) = read.next().await {
-                let message = message?;
-                let mut wavelets = vec![];
-
-                if message.is_binary() {
-                    let data = message.into_payload();
-                    let reader = serialize::read_message(
-                        data.as_ref(),
-                        ReaderOptions::default()
-                    ).unwrap();
-                    let server_message = reader.get_root::<server_message::Reader>().unwrap();
-                    let beams = server_message.get_beams().unwrap();
-                    for beam in beams {
-                        let beam_name = beam.get_name().unwrap().to_string().unwrap();
-                        tracing::trace!("Beam: {}", beam_name);
-                        let photons = beam.get_photons().unwrap();
-                        let mut wav_vec = vec![];
-                        for photon in photons {
-                            let index = photon.get_index();
-                            let time = photon.get_time();
-                            let payload = photon.get_payload().unwrap();
-                            tracing::trace!("Index: {}, Time: {}, Data: {:?}", index, time, payload);
-                            wav_vec.push(Photon{index, time, payload: payload.to_vec()});
-                        }
-                        wavelets.push(Wavelet{beam: beam_name, photons: wav_vec});
+            read_loop(
+                read,
+                |id: u64, rtype: ResponseType| { 
+                    let mut lock = match read_responses.lock() {
+                        Ok(lock) => lock,
+                        Err(_) => return Err(SendError((id, rtype)))
+                    };
+                    if let Some(tx) = lock.remove(&id) {
+                        tx.send(rtype).ok();
                     }
-                } else if message.is_text() {
-                    let data = message.as_text().unwrap();
-                    let msg: ServerResponse = serde_json::from_str(data).unwrap();
-                    tracing::trace!("Server response: {:?}", msg);
-
-                    if let Some(tx) = read_responses.lock().unwrap().remove(&msg.id) {
-                        tx.send(msg.rtype).ok();
-                    }
-                }
-                for wavelet in wavelets {
-                    tx_messages.send(wavelet).await.unwrap();
-                }
+                    Ok(())
+                },
+                |wavelet| tx_messages.send(wavelet)
+            ).await
+        });
+        let wavelet_task = spawn(async move {
+            while let Some(msg) = rx_messages.recv().await {
+                wavelet_fn(msg).await
             }
-            tracing::info!("Exit read thread");
-            Ok::<_, WSError>(())
         });
 
         let mut client = Self{
@@ -205,8 +415,8 @@ impl Client {
             cmd_id: 0,
             write,
             beams: HashSet::new(),
-            messages: Some(rx_messages),
             read_task,
+            wavelet_task,
             responses
         };
         client.transmissions().await?;
@@ -221,102 +431,38 @@ impl Client {
         (id, rx)
     }
 
-    pub async fn add_beam<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
+    async fn send_msg<F>(&mut self, msg_fn: F) -> Result<ResponseType, ClientError>
+        where F: FnOnce(u64) -> Message
+    {
         let (id, rx) = self.next_message();
-        self.write.send(add_beam_message(id, beam.into())).await
-            .map_err(|_| ClientError::Disconnected)?;
-        let response = rx.await;
+        self.write.send(msg_fn(id)).await.map_err(|_| ClientError::Disconnected)?;
+        rx.await.map_err(|_| ClientError::Disconnected)
+    }
 
-        match response {
-            Ok(ResponseType::Beams(_)) => {
-                Err(ClientError::UnexpectedMessage)
-            }
-            Ok(ResponseType::Ack) => {
-                Ok(())
-            }
-            Ok(ResponseType::Error(err)) => {
-                Err(ClientError::ErrorResult(err))
-            }
-            Err(_) => {
-                Err(ClientError::Disconnected)
-            }
-        }
+    pub async fn add_beam<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
+        let response = self.send_msg(|id| add_beam_message(id, beam.into())).await?;
+        ack_result(response)
     }
 
     pub async fn transmissions(&mut self) -> Result<Vec<Beam>, ClientError> {
-        let (id, rx) = self.next_message();
-        self.write.send(transmissions_message(id)).await
-            .map_err(|_| ClientError::Disconnected)?;
-
-        let response = rx.await;
-        match response {
-            Ok(ResponseType::Beams(beams)) => {
-                self.beams.extend(beams.iter().cloned());
-                Ok(beams)
-            }
-            Ok(ResponseType::Ack) => {
-                Err(ClientError::UnexpectedMessage)
-            }
-            Ok(ResponseType::Error(err)) => {
-                Err(ClientError::ErrorResult(err))
-            }
-            Err(_) => {
-                Err(ClientError::Disconnected)
-            }
-        }
+        let response = self.send_msg(transmissions_message).await?;
+        beam_result(response, &mut self.beams)
     }
 
     pub async fn subscribe<B: Into<Beam>>(&mut self, beam: B, index: Option<u64>) -> Result<(), ClientError> {
-        let (id, rx) = self.next_message();
-        self.write.send(sub_message(id, beam.into(), index)).await
-            .map_err(|_| ClientError::Disconnected)?;
-        let response = rx.await;
-        match response {
-            Ok(ResponseType::Beams(_)) => {
-                Err(ClientError::UnexpectedMessage)
-            }
-            Ok(ResponseType::Ack) => {
-                Ok(())
-            }
-            Ok(ResponseType::Error(err)) => {
-                Err(ClientError::ErrorResult(err))
-            }
-            Err(_) => {
-                Err(ClientError::Disconnected)
-            }
-        }
+        let response = self.send_msg(|id| sub_message(id, beam.into(), index)).await?;
+        ack_result(response)
     }
 
     pub async fn unsubscribe<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
-        let (id, rx) = self.next_message();
-        self.write.send(unsub_message(id, beam.into())).await
-            .map_err(|_| ClientError::Disconnected)?;
-        let response = rx.await;
-        match response {
-            Ok(ResponseType::Beams(_)) => {
-                Err(ClientError::UnexpectedMessage)
-            }
-            Ok(ResponseType::Ack) => {
-                Ok(())
-            }
-            Ok(ResponseType::Error(err)) => {
-                Err(ClientError::ErrorResult(err))
-            }
-            Err(_) => {
-                Err(ClientError::Disconnected)
-            }
-        }
+        let response = self.send_msg(|id| unsub_message(id, beam.into())).await?;
+        ack_result(response)
     }
 
     pub async fn emit<B: Into<Beam>>(&mut self, beam: B, data: Vec<u8>) -> Result<(), ClientError> {
         self.write.send(emit_message(beam.into(), data)).await.map_err(|_| ClientError::Disconnected)
     }
-
-    pub fn get_message_rx(&mut self) -> Option<mpsc::Receiver<Wavelet>> {
-        self.messages.take()
-    }
 }
-
 
 #[cfg(test)]
 mod tests {
