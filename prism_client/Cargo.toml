@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 bytes = "1.5.0"
 capnp = "0.18"
-futures-util = { version = "0.3.29", features = ["tokio-io"] }
+futures-util = { version = "0.3.29", features = ["tokio-io", "sink"] }
 http = "0.2.0"
 prism_schema = { path = "../prism_schema" }
 rustls = "0.21.8"

@@ -1,0 +1,30 @@
+[project]
+name = 'prism'
+requires-python = '>=3.7'
+authors = [
+    {name = 'Teague Lasser'},
+]
+
+dynamic = [
+    'description',
+    'license',
+    'readme',
+]
+
+[project.urls]
+Homepage = 'https://github.com/kraemahz/prism'
+Source = 'https://github.com/kraemahz/prism'
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+module-name = "prism._prism"
+bindings = 'pyo3'
+features = ["pyo3/extension-module"]
+
+[tool.black]
+line-length = 119
+target-version = ['py35']
