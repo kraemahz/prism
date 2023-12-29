@@ -137,6 +137,7 @@ async fn handle_request(client_id: ClientId,
     let ClientRequest{id: request_id, rtype} = request;
     let response_type = match rtype {
         RequestType::ListBeams => {
+            tracing::info!("ListBeams {:?}", client_id);
             let beams = beam_server.list_beams().await;
             let beams: Vec<_> = beams.into_iter().map(|b| b.to_string()).collect();
             ResponseType::Beams(beams)
@@ -149,6 +150,7 @@ async fn handle_request(client_id: ClientId,
 
             match beam_server.new_writer(client_id, &beam).await {
                 Ok(fetch_writer) => {
+                    tracing::info!("Add beam: {}", beam);
                     writers.insert(beam.clone(), fetch_writer);
                     ResponseType::Ack
                 },
@@ -158,11 +160,13 @@ async fn handle_request(client_id: ClientId,
             }
         }
         RequestType::Subscribe(beam, index) => {
+            tracing::info!("Subscribe {:?}: {}", client_id, beam);
             let beam = get_handle(beam, &beams_table);
             beam_server.subscribe(client_id, beam, index).await;
             ResponseType::Ack
         }
         RequestType::Unsubscribe(beam) => {
+            tracing::info!("Unsubscribe {:?}: {}", client_id, beam);
             let beam = get_handle(beam, &beams_table);
             beam_server.unsubscribe(client_id, beam).await;
             ResponseType::Ack

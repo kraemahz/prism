@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::thread::spawn as spawn_thread;
 
@@ -95,6 +96,17 @@ pub enum ClientError {
     UnexpectedMessage,
     ErrorResult(String),
     Disconnected
+}
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectionFailed => write!(f, "ClientError::ConnectionFailed"),
+            Self::UnexpectedMessage => write!(f, "ClientError::UnexpectedMessage"),
+            Self::ErrorResult(s) => write!(f, "ClientError::ErrorResult({})", s),
+            Self::Disconnected => write!(f, "ClientError::Disconnected")
+        }
+    }
 }
 
 
@@ -233,7 +245,7 @@ pub fn ack_result(rtype: ResponseType) -> Result<(), ClientError> {
 
 pub struct Client {
     msg_id: u64,
-    message_into: std::sync::mpsc::SyncSender<(Option<u64>, Message)>,
+    message_into: mpsc::UnboundedSender<(Option<u64>, Message)>,
     response_from: std::sync::mpsc::Receiver<ResponseType>,
     beams: HashSet<Beam>
 }
@@ -242,16 +254,22 @@ impl Client {
     pub fn connect<F>(uri: Uri, wavelet_fn: F) -> Self
         where F: Fn(Wavelet) -> Result<(), Wavelet> + Send + Sync + 'static
     {
-        let (message_into, message_from) = std::sync::mpsc::sync_channel(1);
+        let (message_into, mut message_from) = mpsc::unbounded_channel();
         let (response_into, response_from) = std::sync::mpsc::channel();
 
         spawn_thread(move || {
-            let rt = RuntimeBuilder::new_current_thread().build().unwrap();
+            let rt = RuntimeBuilder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
             rt.block_on(async {
                 // TODO: Reconnect
                 let (_client_id, mut write, read) = match connect(uri).await {
                     Ok(result) => result,
-                    Err(_) => return
+                    Err(err) => {
+                        eprintln!("Connection failed: {:?}", err);
+                        return;
+                    }
                 };
                 let responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>> = Arc::new(Mutex::new(HashMap::new()));
                 let read_responses = responses.clone();
@@ -269,7 +287,7 @@ impl Client {
                     ).await
                 });
 
-                while let Ok((id, msg)) = message_from.recv() {
+                while let Some((id, msg)) = message_from.recv().await {
                     let (tx, rx) = oneshot::channel();
 
                     match id {
@@ -313,7 +331,9 @@ impl Client {
         }
         match self.response_from.recv() {
             Ok(response) => ack_result(response),
-            Err(_) => Err(ClientError::Disconnected)
+            Err(_) => {
+                Err(ClientError::Disconnected)
+            }
         }
     }
 

@@ -54,6 +54,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     let server = BeamServerHandle::new(base_dir, &mut table).await
         .expect("Could not start beam server");
+    tracing::info!("Listening on {}", "127.0.0.1:5050");
     let web_task = run_web_server("127.0.0.1:5050",
                                   Arc::new(Mutex::new(table)),
                                   server,
