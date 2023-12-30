@@ -1,5 +1,5 @@
 [project]
-name = 'prism'
+name = 'prism-client'
 requires-python = '>=3.7'
 authors = [
     {name = 'Teague Lasser'},
