@@ -152,7 +152,7 @@ pub async fn connect(uri: Uri) -> Result<(u64, Sink, Stream), ClientError> {
     Ok((client_id, write, read))
 }
 
-fn inner_read_loop<F, G>(message: Message, response_fn: &F, message_fn: &G) -> Result<(), WSError>
+fn inner_read_loop<F, G>(message: Message, response_fn: &F, message_fn: &mut G) -> Result<(), WSError>
     where F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
           G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
 {
@@ -207,13 +207,13 @@ fn inner_read_loop<F, G>(message: Message, response_fn: &F, message_fn: &G) -> R
 
 pub async fn read_loop<F, G>(mut read: Stream,
                              response_fn: F,
-                             message_fn: G) -> Result<(), WSError>
+                             mut message_fn: G) -> Result<(), WSError>
     where F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
           G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
 {
     while let Some(message) = read.next().await {
         let message = message?;
-        if inner_read_loop(message, &response_fn, &message_fn).is_err() {
+        if inner_read_loop(message, &response_fn, &mut message_fn).is_err() {
             break;
         }
     }
