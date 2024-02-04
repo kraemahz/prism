@@ -374,10 +374,10 @@ impl Beam {
         for dir in dirs {
             let mut queue_dir = base_dir.clone();
             queue_dir.push(&dir);
-            let queue = match DurableQueueWriter::from_path(queue_dir, beam.clone()).await {
+            let queue = match DurableQueueWriter::from_path(queue_dir.clone(), beam.clone()).await {
                 Ok(queue) => queue,
                 Err(_) => {
-                    tracing::error!("Missing queue entry: {:?}", dir);
+                    tracing::error!("Missing queue entry: {:?}", queue_dir);
                     continue
                 }
             };
