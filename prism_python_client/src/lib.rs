@@ -1,11 +1,9 @@
-use std::fmt;
-use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError, PyTypeError, PyException};
-use pyo3::types::PyBytes;
-use prism_client::{Client as PrismClient,
-                   Wavelet as PrismWavelet,
-                   Photon as PrismPhoton};
 use http::Uri;
+use prism_client::{Client as PrismClient, Photon as PrismPhoton, Wavelet as PrismWavelet};
+use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+use std::fmt;
 
 #[pyclass]
 #[derive(Clone, Debug)]
@@ -15,24 +13,22 @@ struct Photon {
     #[pyo3(get)]
     time: i64,
     #[pyo3(get)]
-    payload: PyObject
+    payload: PyObject,
 }
 
 impl Photon {
     fn from_rust(py: Python, photon: &PrismPhoton) -> Self {
         Self {
-          index: photon.index,
-          time: photon.time,
-          payload: PyBytes::new(py, photon.payload.as_slice()).to_object(py)
+            index: photon.index,
+            time: photon.time,
+            payload: PyBytes::new(py, photon.payload.as_slice()).to_object(py),
         }
     }
 }
 
 impl fmt::Display for Photon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Photon({}, {}, <payload>)",
-               self.index,
-               self.time)
+        write!(f, "Photon({}, {}, <payload>)", self.index, self.time)
     }
 }
 
@@ -49,17 +45,17 @@ struct Wavelet {
     #[pyo3(get)]
     beam: String,
     #[pyo3(get)]
-    photons: Vec<Photon>
+    photons: Vec<Photon>,
 }
 
 impl Wavelet {
     fn from_rust(py: Python, wavelet: &PrismWavelet) -> Self {
-        let PrismWavelet{beam, photons} = wavelet;
-        let photons = photons
-            .iter()
-            .map(|ph| Photon::from_rust(py, ph))
-            .collect();
-        Self { beam: beam.to_string(), photons }
+        let PrismWavelet { beam, photons } = wavelet;
+        let photons = photons.iter().map(|ph| Photon::from_rust(py, ph)).collect();
+        Self {
+            beam: beam.to_string(),
+            photons,
+        }
     }
 }
 
@@ -102,39 +98,43 @@ impl Client {
 
         let uri = match addr.parse::<Uri>() {
             Ok(uri) => uri,
-            Err(_) => return Err(PyErr::new::<PyValueError, _>("Invalid URI"))
+            Err(_) => return Err(PyErr::new::<PyValueError, _>("Invalid URI")),
         };
-        let inner = PrismClient::connect(
-            uri,
-            move |wavelet: PrismWavelet| wavelet_handler(wavelet, event_callable.clone())
-        );
+        let inner = PrismClient::connect(uri, move |wavelet: PrismWavelet| {
+            wavelet_handler(wavelet, event_callable.clone())
+        });
 
         Ok(Self { inner })
     }
 
     pub fn add_beam(&mut self, beam: String) -> PyResult<()> {
-        self.inner.add_beam(beam).map_err(|err|
-            PyErr::new::<PyException, _>(err.to_string()))
+        self.inner
+            .add_beam(beam)
+            .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
     }
 
     pub fn transmissions(&mut self) -> PyResult<Vec<String>> {
-        self.inner.transmissions().map_err(|err|
-            PyErr::new::<PyException, _>(err.to_string()))
+        self.inner
+            .transmissions()
+            .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
     }
 
     pub fn subscribe(&mut self, beam: String, index: Option<u64>) -> PyResult<()> {
-        self.inner.subscribe(beam, index).map_err(|err|
-            PyErr::new::<PyException, _>(err.to_string()))
+        self.inner
+            .subscribe(beam, index)
+            .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
     }
 
     pub fn unsubscribe(&mut self, beam: String) -> PyResult<()> {
-        self.inner.unsubscribe(beam).map_err(|err|
-            PyErr::new::<PyException, _>(err.to_string()))
+        self.inner
+            .unsubscribe(beam)
+            .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
     }
 
     pub fn emit(&mut self, beam: String, payload: &PyBytes) -> PyResult<()> {
-        self.inner.emit(beam, payload.as_bytes().to_vec()).map_err(|err|
-            PyErr::new::<PyException, _>(err.to_string()))
+        self.inner
+            .emit(beam, payload.as_bytes().to_vec())
+            .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
     }
 }
 
