@@ -2,38 +2,34 @@ use std::ffi::OsStr;
 use std::fs::remove_file;
 use std::io::Result as IOResult;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use capnp::message::{Builder, ReaderOptions};
 use capnp_futures::serialize;
 use chrono::Utc;
 use crc32fast::Hasher;
-use tokio::fs::{File, OpenOptions, create_dir, read_dir};
+use tokio::fs::{create_dir, read_dir, File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use prism_schema::log::disk_entry;
 
-
 pub const CHANNEL_SIZE: usize = 1_000;
 const LOG_EXT: &str = "tracing";
-
 
 #[derive(Debug)]
 pub enum NextError {
     TryAgain,
-    Closed
+    Closed,
 }
-
 
 #[derive(Clone, Debug)]
 pub struct Photon {
     pub beam: Arc<str>,
-    pub payload: Vec<u8>
+    pub payload: Vec<u8>,
 }
-
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -42,16 +38,14 @@ pub struct Entry {
     pub payload: Vec<u8>,
 }
 
-
 #[derive(Debug)]
 pub struct DurableQueueWriter {
     beam: Arc<str>,
     base_dir: PathBuf,
     log_file: BufWriter<File>,
     index: Arc<AtomicU64>,
-    queue: broadcast::Sender<Entry>
+    queue: broadcast::Sender<Entry>,
 }
-
 
 impl Drop for DurableQueueWriter {
     fn drop(&mut self) {
@@ -60,14 +54,13 @@ impl Drop for DurableQueueWriter {
     }
 }
 
-
 impl DurableQueueWriter {
     /// Find the highest index in the directory if it exists.
     async fn find_max_index(path: &Path) -> IOResult<Option<u64>> {
         let mut max_number: Option<u64> = None;
         let mut entries = read_dir(path).await?;
 
-        while let Some(entry) = entries.next_entry().await? { 
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.is_file() {
                 if let Some(file_stem) = path.file_stem().and_then(OsStr::to_str) {
@@ -92,14 +85,11 @@ impl DurableQueueWriter {
             let mut file = std::io::BufReader::new(&mut log_file);
             let mut index = 0;
 
-            while let Ok(message) = capnp::serialize::read_message(&mut file, ReaderOptions::new()) {
-                let entry = message.get_root::<disk_entry::Reader>()
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Failed to create message root"
-                        )
-                    })?;
+            while let Ok(message) = capnp::serialize::read_message(&mut file, ReaderOptions::new())
+            {
+                let entry = message.get_root::<disk_entry::Reader>().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "Failed to create message root")
+                })?;
                 index = entry.get_index();
             }
             Ok(index)
@@ -114,22 +104,22 @@ impl DurableQueueWriter {
             .write(true)
             .open(lock_path)
             .await
-            .map_err(|_|
+            .map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "Could not create exclusive filesystem lock"))?;
+                    "Could not create exclusive filesystem lock",
+                )
+            })?;
         lock_file.write_u32(std::process::id()).await?;
         lock_file.flush().await?;
         Ok(())
     }
 
     /// Constructors
-    pub async fn create_by_beam(base_dir: &Path,
-                                beam: Arc<str>,
-                                partition: u64) -> IOResult<Self> {
+    pub async fn create_by_beam(base_dir: &Path, beam: Arc<str>, partition: u64) -> IOResult<Self> {
         let mut queue_path = PathBuf::from(base_dir);
         queue_path.push(format!("{}-{}", beam, partition));
-        create_dir(&queue_path).await?; 
+        create_dir(&queue_path).await?;
         DurableQueueWriter::create(beam, queue_path.as_path()).await
     }
 
@@ -160,7 +150,7 @@ impl DurableQueueWriter {
     pub fn base_dir(&self) -> PathBuf {
         self.base_dir.clone()
     }
-    
+
     pub fn queue(&self) -> broadcast::Sender<Entry> {
         self.queue.clone()
     }
@@ -211,7 +201,8 @@ impl DurableQueueWriter {
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Serialization error: {:?}", e))
+                    format!("Serialization error: {:?}", e),
+                )
             })?;
         self.log_file.flush().await?;
 
@@ -219,12 +210,16 @@ impl DurableQueueWriter {
     }
 
     fn queue_push(&mut self, time: i64, payload: &[u8]) {
-        self.queue.send(Entry{index: self.index.load(Ordering::Acquire),
-                              time, 
-                              payload: payload.to_vec()}).ok();
+        self.queue
+            .send(Entry {
+                index: self.index.load(Ordering::Acquire),
+                time,
+                payload: payload.to_vec(),
+            })
+            .ok();
     }
 
-    pub async fn push(&mut self, payload: &[u8])-> IOResult<()> {
+    pub async fn push(&mut self, payload: &[u8]) -> IOResult<()> {
         let now = Utc::now().timestamp();
         tracing::trace!("Disk push");
         self.disk_push(now, payload).await?;
@@ -235,7 +230,6 @@ impl DurableQueueWriter {
     }
 }
 
-
 pub struct DurableQueueReader {
     beam: Arc<str>,
     base_dir: PathBuf,
@@ -243,17 +237,19 @@ pub struct DurableQueueReader {
 
     index: u64,
     memory_index: u64,
-    queue: broadcast::Receiver<Entry>
+    queue: broadcast::Receiver<Entry>,
 }
 
 impl DurableQueueReader {
-    pub async fn new(beam: Arc<str>,
-                     base_dir: PathBuf,
-                     queue: broadcast::Receiver<Entry>,
-                     start_index: u64,
-                     memory_index: u64) -> IOResult<Self> {
+    pub async fn new(
+        beam: Arc<str>,
+        base_dir: PathBuf,
+        queue: broadcast::Receiver<Entry>,
+        start_index: u64,
+        memory_index: u64,
+    ) -> IOResult<Self> {
         // TODO: Rollover
-        let current_segment = 0;  // TODO: Modify segment based on start index. 
+        let current_segment = 0; // TODO: Modify segment based on start index.
 
         let mut log_path = PathBuf::from(&base_dir);
         log_path.push(format!("{}.{}", current_segment, LOG_EXT));
@@ -266,7 +262,7 @@ impl DurableQueueReader {
             log_file: log_file.compat(),
             index: start_index,
             memory_index,
-            queue
+            queue,
         })
     }
 
@@ -313,10 +309,8 @@ impl DurableQueueReader {
     }
 
     async fn read_from_log(&mut self) -> Option<Entry> {
-        let message_result = serialize::read_message(
-            &mut self.log_file,
-            ReaderOptions::new()
-        ).await;
+        let message_result =
+            serialize::read_message(&mut self.log_file, ReaderOptions::new()).await;
 
         let reader = match message_result {
             Ok(r) => r,
@@ -333,28 +327,30 @@ impl DurableQueueReader {
         if hash != 0 {
             let mut hasher = Hasher::new();
             hasher.update(&payload);
-            let new_hash  = hasher.finalize();
+            let new_hash = hasher.finalize();
             if hash != new_hash {
-                tracing::warn!("Hash failed for message in {:?} indexed {}", self.base_dir, index);
+                tracing::warn!(
+                    "Hash failed for message in {:?} indexed {}",
+                    self.base_dir,
+                    index
+                );
                 return None;
             }
         }
 
-        Some(Entry{
+        Some(Entry {
             index,
             time,
-            payload: payload.to_vec()
+            payload: payload.to_vec(),
         })
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::runtime::Runtime;
     use tempfile::{tempdir, TempDir};
+    use tokio::runtime::Runtime;
 
     fn setup() -> TempDir {
         tempdir().expect("Failed to assign temporary directory")
@@ -369,9 +365,12 @@ mod tests {
     fn test_queue_creation() {
         let dir = setup();
         let base_dir = dir.path().to_path_buf();
-        let writer = block_on(
-            DurableQueueWriter::create_by_beam(&base_dir, Arc::from("test_queue"), 0)
-        ).expect("Failed to create queue");
+        let writer = block_on(DurableQueueWriter::create_by_beam(
+            &base_dir,
+            Arc::from("test_queue"),
+            0,
+        ))
+        .expect("Failed to create queue");
         assert_eq!(writer.index().load(Ordering::Relaxed), 0);
         // Additional assertions to validate the state of the writer and reader can be added here.
     }
@@ -380,16 +379,24 @@ mod tests {
     fn test_push_and_read() {
         let dir = setup();
         let base_dir = dir.path().to_path_buf();
-        let mut writer = block_on(
-            DurableQueueWriter::create_by_beam(&base_dir, Arc::from("test_queue"), 0)
-        ).expect("Failed to create queue");
+        let mut writer = block_on(DurableQueueWriter::create_by_beam(
+            &base_dir,
+            Arc::from("test_queue"),
+            0,
+        ))
+        .expect("Failed to create queue");
 
         let beam = writer.beam();
         let queue = writer.queue();
         let reader_dir = writer.base_dir();
-        let mut reader = block_on(
-            DurableQueueReader::new(beam, reader_dir, queue.subscribe(), 0, 0)
-        ).expect("Reader creation");
+        let mut reader = block_on(DurableQueueReader::new(
+            beam,
+            reader_dir,
+            queue.subscribe(),
+            0,
+            0,
+        ))
+        .expect("Reader creation");
 
         let payload1 = b"Hello, World! 1".to_vec();
         block_on(writer.push(&payload1)).expect("Failed to push to queue");

@@ -1,17 +1,17 @@
-use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind, Result};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{atomic::Ordering, Arc};
 
 use async_recursion::async_recursion;
-use globset::{Glob, GlobSetBuilder, GlobSet};
-use tokio::task::JoinSet;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
+use tokio::task::JoinSet;
 
-use crate::queue::{DurableQueueWriter, DurableQueueReader, Entry, NextError};
+use crate::queue::{DurableQueueReader, DurableQueueWriter, Entry, NextError};
 pub type ClientSender = mpsc::UnboundedSender<(Arc<str>, Entry)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -24,7 +24,9 @@ pub struct BeamsTable {
 
 impl BeamsTable {
     pub fn new() -> Self {
-        Self { table: HashSet::new() }
+        Self {
+            table: HashSet::new(),
+        }
     }
 
     pub fn get_or_insert(&mut self, string: &str) -> Arc<str> {
@@ -41,13 +43,15 @@ impl BeamsTable {
 
 #[derive(Clone, Debug)]
 pub struct BeamServerHandle {
-    beam_server: Arc<AsyncMutex<BeamServer>>
+    beam_server: Arc<AsyncMutex<BeamServer>>,
 }
 
 impl BeamServerHandle {
     pub async fn new(base_dir: PathBuf, table: &mut BeamsTable) -> Result<Self> {
         let beam_server = BeamServer::new(base_dir, table).await?;
-        Ok(Self { beam_server: Arc::new(AsyncMutex::new(beam_server)) })
+        Ok(Self {
+            beam_server: Arc::new(AsyncMutex::new(beam_server)),
+        })
     }
 
     pub async fn list_beams(&self) -> Vec<Arc<str>> {
@@ -56,7 +60,11 @@ impl BeamServerHandle {
         server.list_beams()
     }
 
-    pub async fn new_writer(&self, client_id: ClientId, beam: &Arc<str>) -> Result<DurableQueueWriter> {
+    pub async fn new_writer(
+        &self,
+        client_id: ClientId,
+        beam: &Arc<str>,
+    ) -> Result<DurableQueueWriter> {
         let mut server = self.beam_server.lock().await;
         tracing::debug!("BeamServer::new_writer({:?})", beam);
         server.new_writer(client_id, beam).await
@@ -93,46 +101,46 @@ impl BeamServerHandle {
     }
 }
 
-
 enum HandleUpdate {
-    Senders(Vec<mpsc::UnboundedSender<(Arc<str>, Entry)>>)
+    Senders(Vec<mpsc::UnboundedSender<(Arc<str>, Entry)>>),
 }
-
 
 #[derive(Debug)]
 pub struct BeamReaderSet {
     beam: Arc<str>,
     writer_handles: HashMap<ClientId, (PathBuf, broadcast::Sender<Entry>, Arc<AtomicU64>)>,
     reader_handles: HashMap<ClientId, mpsc::Sender<HandleUpdate>>,
-    subscriptions: HashMap<ClientId, ClientSender>
+    subscriptions: HashMap<ClientId, ClientSender>,
 }
-
 
 impl BeamReaderSet {
     pub fn new(beam: Arc<str>) -> Self {
-        Self { beam,
-               writer_handles: HashMap::new(),
-               reader_handles: HashMap::new(),
-               subscriptions: HashMap::new() }
+        Self {
+            beam,
+            writer_handles: HashMap::new(),
+            reader_handles: HashMap::new(),
+            subscriptions: HashMap::new(),
+        }
     }
 
     async fn spawn_reader(&mut self, client_id: ClientId, index: u64) -> std::io::Result<()> {
         let (base_dir, queue, memory_index) = match self.writer_handles.get(&client_id) {
             Some(wh) => wh,
-            None => return Err(
-                std::io::Error::new(
+            None => {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    "Writer was not found"
-                )
-            )
+                    "Writer was not found",
+                ))
+            }
         };
         let mut reader = DurableQueueReader::new(
             self.beam.clone(),
             base_dir.clone(),
             queue.subscribe(),
             index,
-            memory_index.load(Ordering::Acquire)
-        ).await?;
+            memory_index.load(Ordering::Acquire),
+        )
+        .await?;
         let (tx, mut rx) = mpsc::channel(1);
         self.reader_handles.insert(client_id, tx);
 
@@ -188,11 +196,17 @@ impl BeamReaderSet {
         Ok(())
     }
 
-    pub async fn add_writer(&mut self, client_id: ClientId, writer: &DurableQueueWriter, index: u64) {
+    pub async fn add_writer(
+        &mut self,
+        client_id: ClientId,
+        writer: &DurableQueueWriter,
+        index: u64,
+    ) {
         let base_dir = writer.base_dir();
         let queue = writer.queue();
         let mem_index = writer.index();
-        self.writer_handles.insert(client_id, (base_dir, queue, mem_index));
+        self.writer_handles
+            .insert(client_id, (base_dir, queue, mem_index));
 
         if !self.subscriptions.is_empty() {
             if self.spawn_reader(client_id, index).await.is_err() {
@@ -201,11 +215,19 @@ impl BeamReaderSet {
             }
             let send_vec = self.subscriptions.values().cloned().collect();
             let reader_handle = self.reader_handles.get(&client_id).unwrap();
-            reader_handle.send(HandleUpdate::Senders(send_vec)).await.ok();
+            reader_handle
+                .send(HandleUpdate::Senders(send_vec))
+                .await
+                .ok();
         }
     }
 
-    pub async fn subscribe(&mut self, client_id: ClientId, sender: ClientSender, index: Option<u64>) {
+    pub async fn subscribe(
+        &mut self,
+        client_id: ClientId,
+        sender: ClientSender,
+        index: Option<u64>,
+    ) {
         let was_empty = self.subscriptions.is_empty();
         self.subscriptions.insert(client_id, sender);
         if was_empty {
@@ -221,8 +243,12 @@ impl BeamReaderSet {
                     }
                 }
                 None => {
-                    let clients: Vec<_> = self.writer_handles.iter().map(|(w, (_, _, idx))| (*w, idx.clone())).collect();
-                    for (write_client_id,  memory_index) in clients {
+                    let clients: Vec<_> = self
+                        .writer_handles
+                        .iter()
+                        .map(|(w, (_, _, idx))| (*w, idx.clone()))
+                        .collect();
+                    for (write_client_id, memory_index) in clients {
                         let index = memory_index.load(Ordering::Relaxed);
                         if self.spawn_reader(write_client_id, index).await.is_err() {
                             tracing::warn!("Reader task spawn failed");
@@ -235,7 +261,10 @@ impl BeamReaderSet {
 
         let send_vec: Vec<_> = self.subscriptions.values().cloned().collect();
         for reader_handle in self.reader_handles.values() {
-            reader_handle.send(HandleUpdate::Senders(send_vec.clone())).await.ok();
+            reader_handle
+                .send(HandleUpdate::Senders(send_vec.clone()))
+                .await
+                .ok();
         }
     }
 
@@ -247,66 +276,77 @@ impl BeamReaderSet {
     }
 }
 
-
 #[derive(Debug)]
 pub struct BeamServer {
     base_dir: PathBuf,
     beams: HashMap<Arc<str>, Beam>,
     clients: HashMap<ClientId, mpsc::UnboundedSender<(Arc<str>, Entry)>>,
-    readers: HashMap<Arc<str>, BeamReaderSet>
+    readers: HashMap<Arc<str>, BeamReaderSet>,
 }
 
 impl BeamServer {
     pub async fn new(base_dir: PathBuf, table: &mut BeamsTable) -> Result<Self> {
-         Ok(Self { base_dir: base_dir.clone(),
-                   beams: setup_queues(base_dir, table).await?,
-                   clients: HashMap::new(),
-                   readers: HashMap::new() })
+        Ok(Self {
+            base_dir: base_dir.clone(),
+            beams: setup_queues(base_dir, table).await?,
+            clients: HashMap::new(),
+            readers: HashMap::new(),
+        })
     }
 
     pub fn list_beams(&self) -> Vec<Arc<str>> {
         self.beams.keys().cloned().collect()
     }
 
-    pub async fn new_writer(&mut self, client_id: ClientId, beam_name: &Arc<str>) -> Result<DurableQueueWriter> {
-       let beam = match self.beams.get_mut(beam_name) {
-           Some(beam) => beam,
-           None => {
-               let beam = match Beam::load(&self.base_dir, beam_name.clone()).await {
-                   Ok(beam) => beam,
-                   Err(err) => {
-                       return Err(err);
-                   }
-               };
-               self.beams.insert(beam_name.clone(), beam);
-               self.beams.get_mut(beam_name).unwrap()
-           }
-       };
-       let writer = match beam.next_writer().await {
-           Ok(writer) => writer,
-           Err(err) => {
-               return Err(err);
-           }
-       };
-       let beam_set = self.readers.entry(beam_name.clone())
+    pub async fn new_writer(
+        &mut self,
+        client_id: ClientId,
+        beam_name: &Arc<str>,
+    ) -> Result<DurableQueueWriter> {
+        let beam = match self.beams.get_mut(beam_name) {
+            Some(beam) => beam,
+            None => {
+                let beam = match Beam::load(&self.base_dir, beam_name.clone()).await {
+                    Ok(beam) => beam,
+                    Err(err) => {
+                        return Err(err);
+                    }
+                };
+                self.beams.insert(beam_name.clone(), beam);
+                self.beams.get_mut(beam_name).unwrap()
+            }
+        };
+        let writer = match beam.next_writer().await {
+            Ok(writer) => writer,
+            Err(err) => {
+                return Err(err);
+            }
+        };
+        let beam_set = self
+            .readers
+            .entry(beam_name.clone())
             .or_insert_with(|| BeamReaderSet::new(beam_name.clone()));
-       beam_set.add_writer(client_id, &writer, 0).await;
-       Ok(writer)
+        beam_set.add_writer(client_id, &writer, 0).await;
+        Ok(writer)
     }
 
     pub fn drop_writer(&mut self, writer: DurableQueueWriter) {
-       let beam_name = writer.beam();
-       let beam = match self.beams.get_mut(&beam_name) {
-           Some(beam) => beam,
-           None => {
-               tracing::error!("Writer sent for non-existant beam: {}", beam_name);
-               return;
-           }
-       };
-       beam.reclaim(writer);
+        let beam_name = writer.beam();
+        let beam = match self.beams.get_mut(&beam_name) {
+            Some(beam) => beam,
+            None => {
+                tracing::error!("Writer sent for non-existant beam: {}", beam_name);
+                return;
+            }
+        };
+        beam.reclaim(writer);
     }
 
-    pub fn add_client(&mut self, client_id: ClientId, sink: mpsc::UnboundedSender<(Arc<str>, Entry)>) {
+    pub fn add_client(
+        &mut self,
+        client_id: ClientId,
+        sink: mpsc::UnboundedSender<(Arc<str>, Entry)>,
+    ) {
         self.clients.insert(client_id, sink);
     }
 
@@ -322,7 +362,9 @@ impl BeamServer {
                 return;
             }
         };
-        let beam_set = self.readers.entry(beam.clone())
+        let beam_set = self
+            .readers
+            .entry(beam.clone())
             .or_insert_with(|| BeamReaderSet::new(beam));
         beam_set.subscribe(client_id, sender, index).await;
     }
@@ -330,12 +372,11 @@ impl BeamServer {
     pub fn unsubscribe(&mut self, client_id: ClientId, beam: Arc<str>) {
         let beam_set = match self.readers.get_mut(&beam) {
             Some(beam_set) => beam_set,
-            None => return
+            None => return,
         };
         beam_set.unsubscribe(client_id);
     }
 }
-
 
 #[derive(Debug)]
 pub struct Beam {
@@ -345,13 +386,11 @@ pub struct Beam {
     inactive_writers: Vec<DurableQueueWriter>,
 }
 
-
 impl Drop for Beam {
     fn drop(&mut self) {
         self.dump_to_base_dir().ok();
     }
 }
-
 
 impl Beam {
     const PARTITION_FILE: &'static str = "partitions";
@@ -364,8 +403,8 @@ impl Beam {
             Ok(mut file) => {
                 let mut buffer = Vec::new();
                 file.read_to_end(&mut buffer).await?;
-                serde_json::from_slice(&buffer).map_err(|e|
-                    Error::new(ErrorKind::Other, e.to_string()))?
+                serde_json::from_slice(&buffer)
+                    .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?
             }
             Err(_) => Vec::new(),
         };
@@ -378,7 +417,7 @@ impl Beam {
                 Ok(queue) => queue,
                 Err(_) => {
                     tracing::error!("Missing queue entry: {:?}", dir);
-                    continue
+                    continue;
                 }
             };
             queues.push(queue);
@@ -399,10 +438,9 @@ impl Beam {
 
     pub async fn load(base_dir: &PathBuf, beam: Arc<str>) -> Result<Self> {
         let inactive_writers = Self::load_base_dir(base_dir, beam.clone()).await?;
-        let paths: Vec<PathBuf> = inactive_writers.iter()
-            .map(|w| {
-                PathBuf::from(w.base_dir().file_stem().unwrap())
-            })
+        let paths: Vec<PathBuf> = inactive_writers
+            .iter()
+            .map(|w| PathBuf::from(w.base_dir().file_stem().unwrap()))
             .collect();
 
         Ok(Self {
@@ -420,8 +458,9 @@ impl Beam {
                 let w = DurableQueueWriter::create_by_beam(
                     self.base_dir.as_path(),
                     self.beam.clone(),
-                    self.writer_paths.len() as u64
-                ).await?;
+                    self.writer_paths.len() as u64,
+                )
+                .await?;
                 let path = PathBuf::from(w.base_dir().as_path().file_stem().unwrap());
                 self.writer_paths.push(path.to_path_buf());
                 Ok(w)
@@ -433,7 +472,6 @@ impl Beam {
         self.inactive_writers.push(writer);
     }
 }
-
 
 #[async_recursion]
 async fn walk_with_glob(dir: PathBuf, pattern: GlobSet) -> Vec<PathBuf> {
@@ -467,8 +505,10 @@ async fn walk_with_glob(dir: PathBuf, pattern: GlobSet) -> Vec<PathBuf> {
     dirs
 }
 
-
-pub async fn setup_queues(base_dir: PathBuf, table: &mut BeamsTable) -> Result<HashMap<Arc<str>, Beam>> {
+pub async fn setup_queues(
+    base_dir: PathBuf,
+    table: &mut BeamsTable,
+) -> Result<HashMap<Arc<str>, Beam>> {
     let mut queues = HashMap::new();
 
     let mut glob_builder = GlobSetBuilder::new();

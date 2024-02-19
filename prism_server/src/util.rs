@@ -1,8 +1,7 @@
 use tokio::sync::mpsc;
 
-
 pub struct ShutdownReceiver {
-    rx: mpsc::UnboundedReceiver<()>
+    rx: mpsc::UnboundedReceiver<()>,
 }
 
 impl ShutdownReceiver {
@@ -13,9 +12,8 @@ impl ShutdownReceiver {
 
 #[derive(Clone)]
 pub struct ShutdownSender {
-    tx: mpsc::UnboundedSender<()>
+    tx: mpsc::UnboundedSender<()>,
 }
-
 
 impl ShutdownSender {
     pub fn signal(&self) {
@@ -23,8 +21,7 @@ impl ShutdownSender {
     }
 }
 
-
 pub fn shutdown_channel() -> (ShutdownSender, ShutdownReceiver) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (ShutdownSender{tx}, ShutdownReceiver{rx})
+    (ShutdownSender { tx }, ShutdownReceiver { rx })
 }
