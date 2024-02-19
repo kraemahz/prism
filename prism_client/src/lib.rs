@@ -178,7 +178,7 @@ where
     } else if message.is_text() {
         let data = message.as_text().unwrap();
         let ServerResponse { id, rtype } = serde_json::from_str(data).unwrap();
-        if let Err(_) = response_fn(id, rtype) {
+        if response_fn(id, rtype).is_err() {
             return Err(WSError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "response_fn",
@@ -186,7 +186,7 @@ where
         }
     }
     for wavelet in wavelets {
-        if let Err(_) = message_fn(wavelet) {
+        if message_fn(wavelet).is_err() {
             return Err(WSError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "message_fn",
@@ -279,7 +279,7 @@ impl Client {
                             };
                             Ok(())
                         },
-                        |wavelet| wavelet_fn(wavelet).map_err(|w| SendError(w)),
+                        |wavelet| wavelet_fn(wavelet).map_err(SendError),
                     )
                     .await
                 });
@@ -508,5 +508,5 @@ impl AsyncClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 }
