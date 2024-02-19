@@ -1,11 +1,10 @@
-use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-use prism_server::util::{shutdown_channel, ShutdownSender};
 use prism_server::beam::{BeamServerHandle, BeamsTable};
+use prism_server::util::{shutdown_channel, ShutdownSender};
 use prism_server::web::run_web_server;
-
 
 fn setup_tracing() {
     let tracing_layer = tracing_subscriber::fmt::layer()
@@ -36,14 +35,12 @@ fn setup_tracing() {
     tracing::info!("Prism started");
 }
 
-
 async fn signal(shutdown: ShutdownSender) {
     if tokio::signal::ctrl_c().await.is_err() {
         tracing::error!("Failed to attach to ctrl-c signal");
     }
     shutdown.signal();
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
@@ -52,17 +49,18 @@ async fn main() -> Result<(), std::io::Error> {
     let base_dir = PathBuf::from("temp");
     let (shutdown_tx, shutdown_rx) = shutdown_channel();
 
-    let server = BeamServerHandle::new(base_dir, &mut table).await
+    let server = BeamServerHandle::new(base_dir, &mut table)
+        .await
         .expect("Could not start beam server");
     tracing::info!("Listening on {}", "127.0.0.1:5050");
-    let web_task = run_web_server("127.0.0.1:5050",
-                                  Arc::new(Mutex::new(table)),
-                                  server,
-                                  shutdown_tx.clone()).await
-        .map_err(|e| std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string()
-                ))?;
+    let web_task = run_web_server(
+        "127.0.0.1:5050",
+        Arc::new(Mutex::new(table)),
+        server,
+        shutdown_tx.clone(),
+    )
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let int_task = tokio::task::spawn(signal(shutdown_tx));
 
     // Await shutdown signal

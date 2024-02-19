@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 pub mod log_capnp {
     include!(concat!(env!("OUT_DIR"), "/log_capnp.rs"));
@@ -9,13 +9,12 @@ pub mod pubsub_capnp {
 }
 pub use crate::pubsub_capnp as pubsub;
 
-
 pub type Beam = String;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientRequest {
     pub id: u64,
-    pub rtype: RequestType
+    pub rtype: RequestType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,14 +22,13 @@ pub enum RequestType {
     AddBeam(Beam),
     ListBeams,
     Subscribe(Beam, Option<u64>),
-    Unsubscribe(Beam)
+    Unsubscribe(Beam),
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerResponse {
     pub id: u64,
-    pub rtype: ResponseType
+    pub rtype: ResponseType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

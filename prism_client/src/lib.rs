@@ -4,47 +4,34 @@ use std::sync::{Arc, Mutex};
 use std::thread::spawn as spawn_thread;
 
 use bytes::BytesMut;
-use capnp::message::{Builder, ReaderOptions, HeapAllocator};
+use capnp::message::{Builder, HeapAllocator, ReaderOptions};
 use capnp::serialize;
-use futures_util::Future;
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, stream::StreamExt};
+use futures_util::Future;
+use futures_util::{stream::StreamExt, SinkExt};
 use http::Uri;
 use tokio::net::TcpStream;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::mpsc::error::SendError;
-use tokio::sync::{oneshot, mpsc};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{spawn, JoinHandle};
-use tokio_websockets::{ClientBuilder, MaybeTlsStream, Message, WebsocketStream, Error as WSError};
-
+use tokio_websockets::{ClientBuilder, Error as WSError, MaybeTlsStream, Message, WebsocketStream};
 
 use prism_schema::{
-    Beam,
-    ClientRequest,
-    RequestType,
-    ServerResponse,
-    ResponseType,
-    pubsub::{
-        client_greeting,
-        server_greeting,
-        client_message,
-        server_message
-    }
+    pubsub::{client_greeting, client_message, server_greeting, server_message},
+    Beam, ClientRequest, RequestType, ResponseType, ServerResponse,
 };
 
-
-fn write_to_message(message: Builder<HeapAllocator>) -> Message
-{
+fn write_to_message(message: Builder<HeapAllocator>) -> Message {
     let mut buffer: Vec<u8> = Vec::new();
-    capnp::serialize::write_message(&mut buffer, &message)
-        .expect("Couldn't allocate memory"); // BUG potential
+    capnp::serialize::write_message(&mut buffer, &message).expect("Couldn't allocate memory"); // BUG potential
     let bytes = BytesMut::from(&buffer[..]);
     Message::binary(bytes)
 }
 
 fn sub_message(id: u64, beam: Beam, index: Option<u64>) -> Message {
     let rtype = RequestType::Subscribe(beam, index);
-    let msg = ClientRequest{id, rtype};
+    let msg = ClientRequest { id, rtype };
     let string = serde_json::to_string(&msg).unwrap();
 
     Message::text(string)
@@ -52,7 +39,7 @@ fn sub_message(id: u64, beam: Beam, index: Option<u64>) -> Message {
 
 fn unsub_message(id: u64, beam: Beam) -> Message {
     let rtype = RequestType::Unsubscribe(beam);
-    let msg = ClientRequest{id, rtype};
+    let msg = ClientRequest { id, rtype };
     let string = serde_json::to_string(&msg).unwrap();
     Message::text(string)
 }
@@ -69,13 +56,13 @@ fn emit_message(beam: String, payload: Vec<u8>) -> Message {
 
 fn add_beam_message(id: u64, beam: Beam) -> Message {
     let rtype = RequestType::AddBeam(beam);
-    let msg = ClientRequest{id, rtype};
+    let msg = ClientRequest { id, rtype };
     Message::text(serde_json::to_string(&msg).unwrap())
 }
 
 fn transmissions_message(id: u64) -> Message {
     let rtype = RequestType::ListBeams;
-    let msg = ClientRequest{id, rtype};
+    let msg = ClientRequest { id, rtype };
     let string = serde_json::to_string(&msg).unwrap();
 
     Message::text(string)
@@ -89,13 +76,12 @@ fn greeting() -> Message {
     write_to_message(message)
 }
 
-
 #[derive(Debug)]
 pub enum ClientError {
     ConnectionFailed,
     UnexpectedMessage,
     ErrorResult(String),
-    Disconnected
+    Disconnected,
 }
 
 impl fmt::Display for ClientError {
@@ -104,43 +90,43 @@ impl fmt::Display for ClientError {
             Self::ConnectionFailed => write!(f, "ClientError::ConnectionFailed"),
             Self::UnexpectedMessage => write!(f, "ClientError::UnexpectedMessage"),
             Self::ErrorResult(s) => write!(f, "ClientError::ErrorResult({})", s),
-            Self::Disconnected => write!(f, "ClientError::Disconnected")
+            Self::Disconnected => write!(f, "ClientError::Disconnected"),
         }
     }
 }
 
-
 pub struct Photon {
     pub index: u64,
     pub time: i64,
-    pub payload: Vec<u8>
+    pub payload: Vec<u8>,
 }
-
 
 pub struct Wavelet {
     pub beam: Beam,
-    pub photons: Vec<Photon>
+    pub photons: Vec<Photon>,
 }
-
 
 type Sink = SplitSink<WebsocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type Stream = SplitStream<WebsocketStream<MaybeTlsStream<TcpStream>>>;
 
 pub async fn connect(uri: Uri) -> Result<(u64, Sink, Stream), ClientError> {
-    let (client, _) = ClientBuilder::from_uri(uri).connect().await
+    let (client, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
         .map_err(|_| ClientError::ConnectionFailed)?;
     let (mut write, mut read) = client.split();
-    write.send(greeting()).await.map_err(|_| ClientError::ConnectionFailed)?;
+    write
+        .send(greeting())
+        .await
+        .map_err(|_| ClientError::ConnectionFailed)?;
 
     // Handle server messages and client ID
     let client_id = if let Some(message) = read.next().await {
         let data = message.unwrap().into_payload();
-        let reader = serialize::read_message(
-            data.as_ref(),
-            ReaderOptions::default()
-        ).map_err(|_|
-            ClientError::UnexpectedMessage)?;
-        let greeting = reader.get_root::<server_greeting::Reader>()
+        let reader = serialize::read_message(data.as_ref(), ReaderOptions::default())
+            .map_err(|_| ClientError::UnexpectedMessage)?;
+        let greeting = reader
+            .get_root::<server_greeting::Reader>()
             .map_err(|_| ClientError::UnexpectedMessage)?;
 
         // Extract client ID from server_message
@@ -152,18 +138,20 @@ pub async fn connect(uri: Uri) -> Result<(u64, Sink, Stream), ClientError> {
     Ok((client_id, write, read))
 }
 
-fn inner_read_loop<F, G>(message: Message, response_fn: &F, message_fn: &mut G) -> Result<(), WSError>
-    where F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
-          G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
+fn inner_read_loop<F, G>(
+    message: Message,
+    response_fn: &F,
+    message_fn: &mut G,
+) -> Result<(), WSError>
+where
+    F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
+    G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
 {
     let mut wavelets = vec![];
 
     if message.is_binary() {
         let data = message.into_payload();
-        let reader = serialize::read_message(
-            data.as_ref(),
-            ReaderOptions::default()
-        ).unwrap();
+        let reader = serialize::read_message(data.as_ref(), ReaderOptions::default()).unwrap();
         let server_message = reader.get_root::<server_message::Reader>().unwrap();
         let beams = server_message.get_beams().unwrap();
         for beam in beams {
@@ -176,40 +164,46 @@ fn inner_read_loop<F, G>(message: Message, response_fn: &F, message_fn: &mut G) 
                 let time = photon.get_time();
                 let payload = photon.get_payload().unwrap();
                 tracing::trace!("Index: {}, Time: {}, Data: {:?}", index, time, payload);
-                wav_vec.push(Photon{index, time, payload: payload.to_vec()});
+                wav_vec.push(Photon {
+                    index,
+                    time,
+                    payload: payload.to_vec(),
+                });
             }
-            wavelets.push(Wavelet{beam: beam_name, photons: wav_vec});
+            wavelets.push(Wavelet {
+                beam: beam_name,
+                photons: wav_vec,
+            });
         }
     } else if message.is_text() {
         let data = message.as_text().unwrap();
-        let ServerResponse{id, rtype} = serde_json::from_str(data).unwrap();
-        if let Err(_) = response_fn(id, rtype) {
-            return Err(WSError::Io(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "response_fn"
-                )
-            ));
+        let ServerResponse { id, rtype } = serde_json::from_str(data).unwrap();
+        if response_fn(id, rtype).is_err() {
+            return Err(WSError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "response_fn",
+            )));
         }
     }
     for wavelet in wavelets {
-        if let Err(_) = message_fn(wavelet) {
-            return Err(WSError::Io(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "message_fn"
-                )
-            ));
+        if message_fn(wavelet).is_err() {
+            return Err(WSError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "message_fn",
+            )));
         }
     }
     Ok(())
 }
 
-pub async fn read_loop<F, G>(mut read: Stream,
-                             response_fn: F,
-                             mut message_fn: G) -> Result<(), WSError>
-    where F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
-          G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
+pub async fn read_loop<F, G>(
+    mut read: Stream,
+    response_fn: F,
+    mut message_fn: G,
+) -> Result<(), WSError>
+where
+    F: Fn(u64, ResponseType) -> Result<(), SendError<(u64, ResponseType)>>,
+    G: Fn(Wavelet) -> Result<(), SendError<Wavelet>>,
 {
     while let Some(message) = read.next().await {
         let message = message?;
@@ -221,10 +215,10 @@ pub async fn read_loop<F, G>(mut read: Stream,
     Ok::<_, WSError>(())
 }
 
-pub fn beam_result(rtype: ResponseType,
-                   all_beams: &mut HashSet<Beam>)
-    -> Result<Vec<Beam>, ClientError>
-{
+pub fn beam_result(
+    rtype: ResponseType,
+    all_beams: &mut HashSet<Beam>,
+) -> Result<Vec<Beam>, ClientError> {
     match rtype {
         ResponseType::Beams(beams) => {
             all_beams.extend(beams);
@@ -247,12 +241,13 @@ pub struct Client {
     msg_id: u64,
     message_into: mpsc::UnboundedSender<(Option<u64>, Message)>,
     response_from: std::sync::mpsc::Receiver<ResponseType>,
-    beams: HashSet<Beam>
+    beams: HashSet<Beam>,
 }
 
 impl Client {
     pub fn connect<F>(uri: Uri, wavelet_fn: F) -> Self
-        where F: Fn(Wavelet) -> Result<(), Wavelet> + Send + Sync + 'static
+    where
+        F: Fn(Wavelet) -> Result<(), Wavelet> + Send + Sync + 'static,
     {
         let (message_into, mut message_from) = mpsc::unbounded_channel();
         let (response_into, response_from) = std::sync::mpsc::channel();
@@ -271,7 +266,8 @@ impl Client {
                         return;
                     }
                 };
-                let responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>> = Arc::new(Mutex::new(HashMap::new()));
+                let responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
                 let read_responses = responses.clone();
 
                 spawn(async move {
@@ -283,8 +279,9 @@ impl Client {
                             };
                             Ok(())
                         },
-                        |wavelet| wavelet_fn(wavelet).map_err(|w| SendError(w))
-                    ).await
+                        |wavelet| wavelet_fn(wavelet).map_err(SendError),
+                    )
+                    .await
                 });
 
                 while let Some((id, msg)) = message_from.recv().await {
@@ -314,7 +311,12 @@ impl Client {
                 }
             });
         });
-        Self{msg_id: 0, message_into, response_from, beams: HashSet::new()}
+        Self {
+            msg_id: 0,
+            message_into,
+            response_from,
+            beams: HashSet::new(),
+        }
     }
 
     fn next_id(&mut self) -> u64 {
@@ -331,9 +333,7 @@ impl Client {
         }
         match self.response_from.recv() {
             Ok(response) => ack_result(response),
-            Err(_) => {
-                Err(ClientError::Disconnected)
-            }
+            Err(_) => Err(ClientError::Disconnected),
         }
     }
 
@@ -345,11 +345,15 @@ impl Client {
         }
         match self.response_from.recv() {
             Ok(response) => beam_result(response, &mut self.beams),
-            Err(_) => Err(ClientError::Disconnected)
+            Err(_) => Err(ClientError::Disconnected),
         }
     }
 
-    pub fn subscribe<B: Into<Beam>>(&mut self, beam: B, index: Option<u64>) -> Result<(), ClientError> {
+    pub fn subscribe<B: Into<Beam>>(
+        &mut self,
+        beam: B,
+        index: Option<u64>,
+    ) -> Result<(), ClientError> {
         let id = self.next_id();
         let msg = sub_message(id, beam.into(), index);
         if self.message_into.send((Some(id), msg)).is_err() {
@@ -357,7 +361,7 @@ impl Client {
         }
         match self.response_from.recv() {
             Ok(response) => ack_result(response),
-            Err(_) => Err(ClientError::Disconnected)
+            Err(_) => Err(ClientError::Disconnected),
         }
     }
 
@@ -369,7 +373,7 @@ impl Client {
         }
         match self.response_from.recv() {
             Ok(response) => ack_result(response),
-            Err(_) => Err(ClientError::Disconnected)
+            Err(_) => Err(ClientError::Disconnected),
         }
     }
 
@@ -383,7 +387,7 @@ impl Client {
 }
 
 pub struct AsyncClient {
-    client_id: u64,  // TODO: reconnect
+    client_id: u64, // TODO: reconnect
     cmd_id: u64,
     write: Sink,
     beams: HashSet<Beam>,
@@ -401,28 +405,31 @@ impl Drop for AsyncClient {
 
 impl AsyncClient {
     pub async fn connect<F, Fut>(uri: Uri, wavelet_fn: F) -> Result<Self, ClientError>
-        where F: Fn(Wavelet) -> Fut + Sync + Send + 'static,
-              Fut: Future<Output=()> + Send
+    where
+        F: Fn(Wavelet) -> Fut + Sync + Send + 'static,
+        Fut: Future<Output = ()> + Send,
     {
         let (client_id, write, read) = connect(uri).await?;
         let (tx_messages, mut rx_messages) = mpsc::unbounded_channel();
-        let responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let responses: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseType>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let read_responses = responses.clone();
         let read_task = spawn(async move {
             read_loop(
                 read,
-                |id: u64, rtype: ResponseType| { 
+                |id: u64, rtype: ResponseType| {
                     let mut lock = match read_responses.lock() {
                         Ok(lock) => lock,
-                        Err(_) => return Err(SendError((id, rtype)))
+                        Err(_) => return Err(SendError((id, rtype))),
                     };
                     if let Some(tx) = lock.remove(&id) {
                         tx.send(rtype).ok();
                     }
                     Ok(())
                 },
-                |wavelet| tx_messages.send(wavelet)
-            ).await
+                |wavelet| tx_messages.send(wavelet),
+            )
+            .await
         });
         let wavelet_task = spawn(async move {
             while let Some(msg) = rx_messages.recv().await {
@@ -430,14 +437,14 @@ impl AsyncClient {
             }
         });
 
-        let mut client = Self{
+        let mut client = Self {
             client_id,
             cmd_id: 0,
             write,
             beams: HashSet::new(),
             read_task,
             wavelet_task,
-            responses
+            responses,
         };
         client.transmissions().await?;
         Ok(client)
@@ -452,15 +459,21 @@ impl AsyncClient {
     }
 
     async fn send_msg<F>(&mut self, msg_fn: F) -> Result<ResponseType, ClientError>
-        where F: FnOnce(u64) -> Message
+    where
+        F: FnOnce(u64) -> Message,
     {
         let (id, rx) = self.next_message();
-        self.write.send(msg_fn(id)).await.map_err(|_| ClientError::Disconnected)?;
+        self.write
+            .send(msg_fn(id))
+            .await
+            .map_err(|_| ClientError::Disconnected)?;
         rx.await.map_err(|_| ClientError::Disconnected)
     }
 
     pub async fn add_beam<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
-        let response = self.send_msg(|id| add_beam_message(id, beam.into())).await?;
+        let response = self
+            .send_msg(|id| add_beam_message(id, beam.into()))
+            .await?;
         ack_result(response)
     }
 
@@ -469,8 +482,14 @@ impl AsyncClient {
         beam_result(response, &mut self.beams)
     }
 
-    pub async fn subscribe<B: Into<Beam>>(&mut self, beam: B, index: Option<u64>) -> Result<(), ClientError> {
-        let response = self.send_msg(|id| sub_message(id, beam.into(), index)).await?;
+    pub async fn subscribe<B: Into<Beam>>(
+        &mut self,
+        beam: B,
+        index: Option<u64>,
+    ) -> Result<(), ClientError> {
+        let response = self
+            .send_msg(|id| sub_message(id, beam.into(), index))
+            .await?;
         ack_result(response)
     }
 
@@ -480,11 +499,12 @@ impl AsyncClient {
     }
 
     pub async fn emit<B: Into<Beam>>(&mut self, beam: B, data: Vec<u8>) -> Result<(), ClientError> {
-        self.write.send(emit_message(beam.into(), data)).await.map_err(|_| ClientError::Disconnected)
+        self.write
+            .send(emit_message(beam.into(), data))
+            .await
+            .map_err(|_| ClientError::Disconnected)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-}
+mod tests {}
