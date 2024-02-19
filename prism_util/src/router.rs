@@ -7,6 +7,12 @@ pub struct Router {
     map: AnyMap,
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Router {
     pub fn new() -> Self {
         Self { map: AnyMap::new() }
