@@ -507,6 +507,4 @@ impl AsyncClient {
 }
 
 #[cfg(test)]
-mod tests {
-    
-}
+mod tests {}

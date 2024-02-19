@@ -63,9 +63,7 @@ async fn send_events_task(
 async fn send_events(messages: &mut Vec<(Arc<str>, Entry)>, ws_tx: &mpsc::Sender<Message>) {
     let mut hash: HashMap<Arc<str>, Vec<Entry>> = HashMap::new();
     for (beam_name, entry) in messages.drain(..) {
-        hash.entry(beam_name)
-            .or_default()
-            .push(entry);
+        hash.entry(beam_name).or_default().push(entry);
     }
     let message = entry_to_message(&hash);
     ws_tx.send(message).await.ok();

@@ -1,8 +1,8 @@
+use criterion::{criterion_group, criterion_main, Criterion};
+use prism_server::queue::{DurableQueueReader, DurableQueueWriter};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use criterion::{criterion_group, criterion_main, Criterion};
-use prism_server::queue::{DurableQueueReader, DurableQueueWriter};
 use tempfile::{tempdir, TempDir};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
@@ -45,11 +45,13 @@ fn criterion_benchmark(c: &mut Criterion) {
         let base_dir = dir.path();
 
         let beam: Arc<str> = Arc::from("push_bench");
-        let writer = rt.block_on(DurableQueueWriter::create_by_beam(
-            base_dir,
-            beam.clone(),
-            0
-        )).expect("writer");
+        let writer = rt
+            .block_on(DurableQueueWriter::create_by_beam(
+                base_dir,
+                beam.clone(),
+                0,
+            ))
+            .expect("writer");
         let w = Rc::new(RefCell::new(writer));
         b.to_async(&rt).iter(move || push_benchmark(w.clone()));
     });
@@ -60,20 +62,23 @@ fn criterion_benchmark(c: &mut Criterion) {
         let beam: Arc<str> = Arc::from("read_bench");
         let (_queue_tx, queue_rx) = broadcast::channel(1);
 
-        let writer = rt.block_on(DurableQueueWriter::create_by_beam(
-            base_dir,
-            beam.clone(),
-            0
-        )).expect("writer");
+        let writer = rt
+            .block_on(DurableQueueWriter::create_by_beam(
+                base_dir,
+                beam.clone(),
+                0,
+            ))
+            .expect("writer");
 
-        let reader = rt.block_on(DurableQueueReader::new(
-            beam,
-            base_dir.to_path_buf(),
-            queue_rx,
-            0,
-            0
-        )).expect("reader");
-
+        let reader = rt
+            .block_on(DurableQueueReader::new(
+                beam,
+                base_dir.to_path_buf(),
+                queue_rx,
+                0,
+                0,
+            ))
+            .expect("reader");
 
         let w = Rc::new(RefCell::new(writer));
         let r = Rc::new(RefCell::new(reader));
