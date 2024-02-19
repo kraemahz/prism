@@ -64,7 +64,7 @@ async fn send_events(messages: &mut Vec<(Arc<str>, Entry)>, ws_tx: &mpsc::Sender
     let mut hash: HashMap<Arc<str>, Vec<Entry>> = HashMap::new();
     for (beam_name, entry) in messages.drain(..) {
         hash.entry(beam_name)
-            .or_insert_with(|| Vec::new())
+            .or_default()
             .push(entry);
     }
     let message = entry_to_message(&hash);
@@ -164,13 +164,13 @@ async fn handle_request(
         }
         RequestType::Subscribe(beam, index) => {
             tracing::info!("Subscribe {:?}: {}", client_id, beam);
-            let beam = get_handle(beam, &beams_table);
+            let beam = get_handle(beam, beams_table);
             beam_server.subscribe(client_id, beam, index).await;
             ResponseType::Ack
         }
         RequestType::Unsubscribe(beam) => {
             tracing::info!("Unsubscribe {:?}: {}", client_id, beam);
-            let beam = get_handle(beam, &beams_table);
+            let beam = get_handle(beam, beams_table);
             beam_server.unsubscribe(client_id, beam).await;
             ResponseType::Ack
         }

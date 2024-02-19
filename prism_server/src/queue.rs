@@ -185,7 +185,7 @@ impl DurableQueueWriter {
 
     async fn disk_push<'a>(&mut self, now: i64, payload: &[u8]) -> IOResult<()> {
         let mut hasher = Hasher::new();
-        hasher.update(&payload.as_ref());
+        hasher.update(payload.as_ref());
         let hash = hasher.finalize();
 
         let mut message = Builder::new_default();
@@ -194,7 +194,7 @@ impl DurableQueueWriter {
             entry.set_index(self.index.load(Ordering::Acquire));
             entry.set_time(now);
             entry.set_hash(hash);
-            entry.set_payload(&payload.as_ref());
+            entry.set_payload(payload.as_ref());
         }
         serialize::write_message((&mut self.log_file).compat_write(), message)
             .await
@@ -326,7 +326,7 @@ impl DurableQueueReader {
 
         if hash != 0 {
             let mut hasher = Hasher::new();
-            hasher.update(&payload);
+            hasher.update(payload);
             let new_hash = hasher.finalize();
             if hash != new_hash {
                 tracing::warn!(

@@ -22,6 +22,12 @@ pub struct BeamsTable {
     table: HashSet<Arc<str>>,
 }
 
+impl Default for BeamsTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BeamsTable {
     pub fn new() -> Self {
         Self {
