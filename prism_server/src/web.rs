@@ -7,18 +7,17 @@ use futures_util::{
     stream::{SplitSink, SplitStream, StreamExt},
     SinkExt,
 };
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_websockets::{Error, Message, ServerBuilder, WebsocketStream};
 
 use crate::beam::{BeamServerHandle, BeamsTable, ClientId};
 use crate::queue::{DurableQueueWriter, Entry, Photon};
-use crate::util::ShutdownSender;
 use prism_schema::{
     pubsub::{client_greeting, client_message, server_greeting, server_message},
     ClientRequest, RequestType, ResponseType, ServerResponse,
 };
+use warp::filters::ws::{Message, WebSocket};
+use warp::{Filter, Rejection, Reply};
+
 
 fn write_to_message(message: Builder<HeapAllocator>) -> Message {
     let mut buffer: Vec<u8> = Vec::new();
@@ -70,8 +69,8 @@ async fn send_events(messages: &mut Vec<(Arc<str>, Entry)>, ws_tx: &mpsc::Sender
 }
 
 async fn send_messages_task(
-    client_addr: String,
-    mut ws_sink: SplitSink<WebsocketStream<TcpStream>, Message>,
+    client_id: ClientId,
+    mut ws_sink: SplitSink<WebSocket, Message>,
     mut ws_rx: mpsc::Receiver<Message>,
 ) {
     while let Some(message) = ws_rx.recv().await {
@@ -79,7 +78,7 @@ async fn send_messages_task(
             break;
         }
     }
-    tracing::info!("Client {} stream disconnected", client_addr);
+    tracing::info!("Client({:?}) stream disconnected", client_id);
 }
 
 #[inline]
@@ -186,16 +185,16 @@ async fn handle_request(
 
 async fn handle_client_message_task(
     client_id: ClientId,
-    mut ws_source: SplitStream<WebsocketStream<TcpStream>>,
+    mut ws_source: SplitStream<WebSocket>,
     beam_server: BeamServerHandle,
     beams_table: Arc<Mutex<BeamsTable>>,
     ws_tx: mpsc::Sender<Message>,
-) -> Result<(), Error> {
+) {
     let mut writers = HashMap::new();
 
     while let Some(Ok(msg)) = ws_source.next().await {
         if msg.is_binary() {
-            let buf = msg.into_payload();
+            let buf = msg.as_bytes();
             let bytes = buf.to_vec();
             let reader_result =
                 capnp::serialize::read_message(bytes.as_slice(), ReaderOptions::new());
@@ -210,7 +209,7 @@ async fn handle_client_message_task(
             let entry = Photon { beam, payload };
             send_entry(client_id, entry, &beam_server, &mut writers).await;
         } else if msg.is_text() {
-            let client_request: ClientRequest = match serde_json::from_str(msg.as_text().unwrap()) {
+            let client_request: ClientRequest = match serde_json::from_str(msg.to_str().unwrap()) {
                 Ok(r) => r,
                 Err(_) => {
                     tracing::info!("Invalid message sent by {:?}", client_id);
@@ -228,99 +227,105 @@ async fn handle_client_message_task(
             )
             .await;
         } else if msg.is_ping() {
-            let payload = msg.into_payload();
-            let bytes_mut = BytesMut::from(payload.as_ref());
-            let pong = Message::pong(bytes_mut);
+            let payload = msg.as_bytes();
+            let pong = Message::pong(payload);
             ws_tx.send(pong).await.unwrap();
         }
     }
-    Ok(())
 }
 
-async fn read_greeting(
-    ws_source: &mut SplitStream<WebsocketStream<TcpStream>>,
-) -> Result<u64, Error> {
+async fn read_greeting(ws_source: &mut SplitStream<WebSocket>) -> Option<u64> {
     if let Some(msg) = ws_source.next().await {
-        let msg = msg?;
-        let buf = msg.into_payload();
+        let msg = msg.ok()?;
+        let buf = msg.as_bytes();
         let bytes = buf.to_vec();
         let reader_result = capnp::serialize::read_message(bytes.as_slice(), ReaderOptions::new());
         let reader = reader_result.unwrap();
         let msg = reader.get_root::<client_greeting::Reader>().unwrap();
         let id = msg.get_id();
 
-        return Ok(id);
+        return Some(id);
     }
-    Err(Error::AlreadyClosed)
+    None
 }
 
 async fn send_server_greeting(
-    ws_sink: &mut SplitSink<WebsocketStream<TcpStream>, Message>,
+    ws_sink: &mut SplitSink<WebSocket, Message>,
     client_id: ClientId,
-) -> Result<(), Error> {
+) -> bool {
     let message = {
         let mut message = Builder::new(HeapAllocator::new());
         let mut server_msg = message.init_root::<server_greeting::Builder>();
         server_msg.set_id(client_id.0);
         write_to_message(message)
     };
-    ws_sink.send(message).await?;
-
-    Ok(())
+    !ws_sink.send(message).await.is_err()
 }
 
 pub async fn init_client(
     sent_id: u64,
-    clients: &mut HashSet<u64>,
+    clients: &Arc<Mutex<HashSet<u64>>>,
     beam_server: &BeamServerHandle,
 ) -> (ClientId, mpsc::UnboundedReceiver<(Arc<str>, Entry)>) {
-    let client_id = if clients.contains(&sent_id) {
-        ClientId(sent_id)
-    } else {
-        let rn = rand::random::<u64>();
-        clients.insert(rn);
-        ClientId(rn)
+    let client_id = {
+        let mut clients = clients.lock().unwrap();
+        if clients.contains(&sent_id) {
+            ClientId(sent_id)
+        } else {
+            let rn = rand::random::<u64>();
+            clients.insert(rn);
+            ClientId(rn)
+        }
     };
     let (server_tx, server_rx) = mpsc::unbounded_channel();
     beam_server.add_client(client_id, server_tx).await;
     (client_id, server_rx)
 }
 
-pub async fn run_web_server(
-    addr: &str,
+async fn client_websocket(
+    ws: WebSocket,
+    clients: Arc<Mutex<HashSet<u64>>>,
     beams_table: Arc<Mutex<BeamsTable>>,
     beam_server: BeamServerHandle,
-    shutdown: ShutdownSender,
-) -> Result<JoinHandle<Result<(), Error>>, Error> {
-    let listener = TcpListener::bind(addr).await?;
+) {
+    let (mut ws_sink, mut ws_source) = ws.split();
 
-    Ok::<_, Error>(tokio::spawn(async move {
-        let mut clients: HashSet<u64> = HashSet::new();
+    let sent_id = read_greeting(&mut ws_source).await
+        .expect("Client greeting failed");
+    let (client_id, entry_rx) = init_client(sent_id, &clients, &beam_server).await;
+    if !send_server_greeting(&mut ws_sink, client_id).await {
+        return;
+    }
 
-        while let Ok((stream, client_addr)) = listener.accept().await {
-            let ws_stream = ServerBuilder::new().accept(stream).await?;
-            let (mut ws_sink, mut ws_source) = ws_stream.split();
+    let (ws_tx, ws_rx) = mpsc::channel::<Message>(WS_LIMIT);
 
-            let sent_id = read_greeting(&mut ws_source).await?;
-            let (client_id, entry_rx) = init_client(sent_id, &mut clients, &beam_server).await;
-            send_server_greeting(&mut ws_sink, client_id).await?;
+    tokio::spawn(send_messages_task(client_id, ws_sink, ws_rx));
+    tokio::spawn(send_events_task(entry_rx, ws_tx.clone()));
 
-            let (ws_tx, ws_rx) = mpsc::channel::<Message>(WS_LIMIT);
+    let beams_table = beams_table.clone();
+    tokio::spawn(handle_client_message_task(
+        client_id,
+        ws_source,
+        beam_server.clone(),
+        beams_table,
+        ws_tx,
+    ));
+}
 
-            tokio::spawn(send_messages_task(client_addr.to_string(), ws_sink, ws_rx));
-            tokio::spawn(send_events_task(entry_rx, ws_tx.clone()));
-
-            let beams_table = beams_table.clone();
-            tokio::spawn(handle_client_message_task(
-                client_id,
-                ws_source,
-                beam_server.clone(),
-                beams_table,
-                ws_tx,
-            ));
-        }
-        tracing::info!("Web server exiting");
-        shutdown.signal();
-        Ok(())
-    }))
+pub fn web_clients(
+    beams_table: Arc<Mutex<BeamsTable>>,
+    beam_server: BeamServerHandle,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+    let clients = Arc::new(Mutex::new(HashSet::new()));
+    warp::ws()
+        .map(
+            move |ws: warp::ws::Ws| {
+                let clients = clients.clone();
+                let beams_table = beams_table.clone();
+                let beam_server = beam_server.clone();
+                ws.on_upgrade(move |socket| {
+                    client_websocket(socket, clients, beams_table, beam_server)
+                })
+            },
+        )
 }
