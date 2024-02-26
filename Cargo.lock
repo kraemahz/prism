@@ -1142,7 +1142,7 @@ checksum = "5b40af805b3121feab8a3c29f04d8ad262fa8e0561883e7653e024ae4479e6de"
 
 [[package]]
 name = "prism-pyo3"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "http",
  "prism_client",
