@@ -131,6 +131,10 @@ impl Client {
             .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
     }
 
+    pub fn ping(&mut self) -> PyResult<()> {
+        self.inner.ping().map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
+    }
+
     pub fn emit(&mut self, beam: String, payload: &PyBytes) -> PyResult<()> {
         self.inner
             .emit(beam, payload.as_bytes().to_vec())
