@@ -29,6 +29,12 @@ fn write_to_message(message: Builder<HeapAllocator>) -> Message {
     Message::binary(bytes)
 }
 
+fn ping() -> Message {
+    let payload_bytes: Vec<u8> = Vec::new();
+    let payload = BytesMut::from(&payload_bytes[..]);
+    Message::ping(payload)
+}
+
 fn sub_message(id: u64, beam: Beam, index: Option<u64>) -> Message {
     let rtype = RequestType::Subscribe(beam, index);
     let msg = ClientRequest { id, rtype };
@@ -377,6 +383,14 @@ impl Client {
         }
     }
 
+    pub fn ping(&mut self) -> Result<(), ClientError> {
+        let msg = ping();
+        if self.message_into.send((None, msg)).is_err() {
+            return Err(ClientError::Disconnected);
+        }
+        Ok(())
+    }
+
     pub fn emit<B: Into<Beam>>(&mut self, beam: B, data: Vec<u8>) -> Result<(), ClientError> {
         let msg = emit_message(beam.into(), data);
         if self.message_into.send((None, msg)).is_err() {
@@ -496,6 +510,10 @@ impl AsyncClient {
     pub async fn unsubscribe<B: Into<Beam>>(&mut self, beam: B) -> Result<(), ClientError> {
         let response = self.send_msg(|id| unsub_message(id, beam.into())).await?;
         ack_result(response)
+    }
+
+    pub async fn ping(&mut self) -> Result<(), ClientError> {
+        self.write.send(ping()).await.map_err(|_| ClientError::Disconnected)
     }
 
     pub async fn emit<B: Into<Beam>>(&mut self, beam: B, data: Vec<u8>) -> Result<(), ClientError> {
