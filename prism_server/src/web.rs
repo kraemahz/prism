@@ -78,7 +78,7 @@ async fn send_messages_task(
             break;
         }
     }
-    tracing::info!("Client({:?}) stream disconnected", client_id);
+    tracing::info!("{:?} stream disconnected", client_id);
 }
 
 #[inline]
@@ -101,7 +101,7 @@ async fn send_entry(
     };
 
     // No writer is found, take the slow path.
-    tracing::warn!(
+    tracing::info!(
         "{:?} took the slow path on emit of {}, consider using enable",
         client_id,
         entry.beam
@@ -227,6 +227,7 @@ async fn handle_client_message_task(
             )
             .await;
         } else if msg.is_ping() {
+            tracing::info!("Ping {:?}", client_id);
             let payload = msg.as_bytes();
             let pong = Message::pong(payload);
             ws_tx.send(pong).await.unwrap();

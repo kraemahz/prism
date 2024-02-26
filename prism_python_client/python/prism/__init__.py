@@ -7,8 +7,7 @@ DEFAULT_PING_RATE = 50
 
 def ping_loop(client, rate, event):
     while True:
-        event.wait(rate)
-        if event.is_set():
+        if event.wait(rate):
             break
         client.ping()
 
@@ -17,7 +16,10 @@ class Client:
     def __init__(self, addr, callable, ping_rate=DEFAULT_PING_RATE):
         self._client = RustClient(addr, callable)
         self._event = Event()
-        Thread(target=ping_loop, args=(self._client, ping_rate, self._event))
+        self._thread = Thread(
+            target=ping_loop, args=(self._client, ping_rate, self._event)
+        )
+        self._thread.start()
 
     def __del__(self):
         self._event.set()
