@@ -127,7 +127,8 @@ impl DurableQueueWriter {
         Self::write_lock(base_dir).await?;
         let log_path = base_dir.join(format!("0.{}", LOG_EXT));
         let log_file = OpenOptions::new()
-            .create_new(true)
+            .create(true)
+            .append(true)
             .write(true)
             .open(log_path)
             .await?;
